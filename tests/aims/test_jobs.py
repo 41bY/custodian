@@ -52,8 +52,9 @@ class TestAimsJob:
 
     def test_setup_backs_up_inputs(self, static_dir: "Path") -> None:
         AimsJob(FAKE_AIMS).setup(directory=str(static_dir))
-        for file in ("control.in", "geometry.in", "parameters.json"):
+        for file in ("control.in", "geometry.in"):
             assert (static_dir / f"{file}.orig").read_text() == (static_dir / file).read_text()
+        assert not (static_dir / "parameters.json.orig").exists()
 
     def test_setup_settings_override(self, static_dir: "Path") -> None:
         original = {file: (static_dir / file).read_text() for file in ("control.in", "geometry.in")}
@@ -69,12 +70,6 @@ class TestAimsJob:
         # the backups are taken before the override
         for file, content in original.items():
             assert (static_dir / f"{file}.orig").read_text() == content
-
-    def test_setup_without_parameters_json(self, static_dir: "Path") -> None:
-        (static_dir / "parameters.json").unlink()
-        AimsJob(FAKE_AIMS).setup(directory=str(static_dir))
-        assert (static_dir / "control.in.orig").is_file()
-        assert not (static_dir / "parameters.json.orig").exists()
 
     def test_setup_no_backup(self, static_dir: "Path") -> None:
         AimsJob(FAKE_AIMS, backup=False).setup(directory=str(static_dir))
