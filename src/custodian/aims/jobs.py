@@ -20,9 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Backed up with a ".orig" suffix by AimsJob.setup. parameters.json is the record of the
-# input parameters written by pymatgen (and read back by atomate2); it is optional.
-AIMS_INPUT_FILES = ("control.in", "geometry.in", "parameters.json")
+# Backed up with a ".orig" suffix by AimsJob.setup.
+AIMS_INPUT_FILES = ("control.in", "geometry.in")
 
 # Renamed with the job suffix by AimsJob.postprocess. The inputs keep their
 # names: atomate2 reads geometry.in and parameters.json without suffix.
@@ -61,9 +60,8 @@ class AimsJob(Job):
                 aims.out to aims.out.relax1, provide ".relax1" as the suffix.
             final (bool): Indicating whether this is the final FHI-aims job in a series.
                 The suffixed files are moved if True, copied if False. Defaults to True.
-            backup (bool): Whether to backup the initial input files. If True, control.in,
-                geometry.in and (if present) parameters.json are copied with a ".orig"
-                appended. Defaults to True.
+            backup (bool): Whether to backup the initial input files. If True, control.in
+                and geometry.in are copied with a ".orig" appended. Defaults to True.
             settings_override ([dict]): An ansible style list of dict to override changes,
                 applied by AimsModder after the backup. E.g., to set sc_iter_limit to 300 and
                 to restart a relaxation from its last geometry, provide
@@ -90,12 +88,7 @@ class AimsJob(Job):
 
         if self.backup:
             for file in AIMS_INPUT_FILES:
-                path = os.path.join(directory, file)
-                try:
-                    shutil.copy(path, f"{path}.orig")
-                except FileNotFoundError:
-                    if file != "parameters.json":  # Mandatory files
-                        raise
+                shutil.copy(os.path.join(directory, file), os.path.join(directory, f"{file}.orig"))
 
         if self.settings_override is not None:
             AimsModder(directory=directory).apply_actions(self.settings_override)
