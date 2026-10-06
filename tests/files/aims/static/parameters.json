@@ -1,0 +1,1 @@
+{"xc": "pbe", "relativistic": "atomic_zora scalar", "species_dir": "light", "k_grid": [2, 2, 2], "occupation_type": "gaussian 0.01", "output": ["mulliken_summary"]}
