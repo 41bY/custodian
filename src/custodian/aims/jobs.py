@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from monty.shutil import decompress_dir
 
+from custodian.aims.interpreter import AimsModder
 from custodian.custodian import Job
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ class AimsJob(Job):
         suffix: str = "",
         final: bool = True,
         backup: bool = True,
+        settings_override: list[dict] | None = None,
         terminate_timeout: float = 10.0,
     ) -> None:
         """
@@ -62,6 +64,11 @@ class AimsJob(Job):
             backup (bool): Whether to backup the initial input files. If True, control.in,
                 geometry.in and (if present) parameters.json are copied with a ".orig"
                 appended. Defaults to True.
+            settings_override ([dict]): An ansible style list of dict to override changes,
+                applied by AimsModder after the backup. E.g., to set sc_iter_limit to 300 and
+                to restart a relaxation from its last geometry, provide
+                [{"dict": "control.in", "action": {"_set": {"parameters->sc_iter_limit": 300}}},
+                {"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}}].
             terminate_timeout (float): Timeout in seconds to wait for graceful termination
                 (SIGTERM) before escalating to SIGKILL. Defaults to 10.0 seconds.
         """
@@ -71,12 +78,13 @@ class AimsJob(Job):
         self.suffix = suffix
         self.final = final
         self.backup = backup
+        self.settings_override = settings_override
         self.terminate_timeout = terminate_timeout
 
     def setup(self, directory: str = "./") -> None:
         """
-        Performs initial setup for AimsJob: decompresses the directory and backs up the
-        inputs.
+        Performs initial setup for AimsJob: decompresses the directory, backs up the
+        inputs and applies settings_override.
         """
         decompress_dir(directory)
 
@@ -88,6 +96,9 @@ class AimsJob(Job):
                 except FileNotFoundError:
                     if file != "parameters.json":  # Mandatory files
                         raise
+
+        if self.settings_override is not None:
+            AimsModder(directory=directory).apply_actions(self.settings_override)
 
     def run(self, directory: str = "./") -> subprocess.Popen:
         """
