@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
+from pyfhiaims.control.control import AimsControl
 
 from custodian.aims.jobs import AIMS_OUTPUT_FILES, AimsJob
 from custodian.custodian import Custodian
@@ -31,12 +32,14 @@ def static_dir(tmp_path: "Path") -> "Path":
 
 class TestAimsJob:
     def test_as_from_dict(self) -> None:
-        job = AimsJob(["srun", "aims.x"], suffix=".relax1", final=False)
+        override = [{"dict": "control.in", "action": {"_set": {"parameters->sc_iter_limit": 300}}}]
+        job = AimsJob(["srun", "aims.x"], suffix=".relax1", final=False, settings_override=override)
         job2 = AimsJob.from_dict(job.as_dict())
         assert isinstance(job2, AimsJob)
         assert job2.aims_cmd == ("srun", "aims.x")
         assert job2.suffix == ".relax1"
         assert job2.final is False
+        assert job2.settings_override == override
 
     def test_cmd_from_string(self) -> None:
         assert AimsJob("srun -n 4 aims.x").aims_cmd == ("srun", "-n", "4", "aims.x")
@@ -51,6 +54,21 @@ class TestAimsJob:
         AimsJob(FAKE_AIMS).setup(directory=str(static_dir))
         for file in ("control.in", "geometry.in", "parameters.json"):
             assert (static_dir / f"{file}.orig").read_text() == (static_dir / file).read_text()
+
+    def test_setup_settings_override(self, static_dir: "Path") -> None:
+        original = {file: (static_dir / file).read_text() for file in ("control.in", "geometry.in")}
+        (static_dir / "geometry.in.next_step").write_text("next step")
+        override = [
+            {"dict": "control.in", "action": {"_set": {"parameters->sc_iter_limit": 300}}},
+            {"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}},
+        ]
+        AimsJob(FAKE_AIMS, settings_override=override).setup(directory=str(static_dir))
+
+        assert AimsControl.from_file(static_dir / "control.in").parameters["sc_iter_limit"] == "300"
+        assert (static_dir / "geometry.in").read_text() == "next step"
+        # the backups are taken before the override
+        for file, content in original.items():
+            assert (static_dir / f"{file}.orig").read_text() == content
 
     def test_setup_without_parameters_json(self, static_dir: "Path") -> None:
         (static_dir / "parameters.json").unlink()
