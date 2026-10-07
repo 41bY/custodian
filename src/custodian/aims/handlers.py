@@ -77,7 +77,9 @@ class UnconvergedErrorHandler(ErrorHandler):
                     "prec_mix_param": 0.1,
                 }
             elif (mix := float(params.get("charge_mix_param", 0.05))) > 0.02:
-                new_settings = {"charge_mix_param": max(mix / 2, 0.02), "spin_mix_param": max(mix / 2, 0.02)}
+                # While the Kerker preconditioner is on, FHI-aims mixes the charge with prec_mix_param
+                mix = max(mix / 2, 0.02)
+                new_settings = {"charge_mix_param": mix, "spin_mix_param": mix, "prec_mix_param": mix}
             elif int(params["sc_iter_limit"]) < self.max_sc_iter_limit:
                 new_settings = {"sc_iter_limit": self.max_sc_iter_limit}
             else:
