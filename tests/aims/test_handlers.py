@@ -44,7 +44,7 @@ class TestUnconvergedErrorHandler:
             ({"_set": set_parameters({"n_max_pulay": 14})}, KERKER),
             (
                 {"_set": set_parameters({"n_max_pulay": 14, **KERKER})},
-                {"charge_mix_param": 0.05, "spin_mix_param": 0.05},
+                {"charge_mix_param": 0.05, "spin_mix_param": 0.05, "prec_mix_param": 0.05},
             ),
             (
                 {"_set": set_parameters({"n_max_pulay": 14, **KERKER, "charge_mix_param": 0.02})},
