@@ -10,7 +10,7 @@ from pyfhiaims.control.control import AimsControl
 
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.io import load_aims_stdout
-from custodian.aims.utils import is_valid_geometry
+from custodian.aims.utils import ScfProfile, is_valid_geometry, scf_profile
 from custodian.custodian import ErrorHandler
 from custodian.utils import backup
 
@@ -25,7 +25,15 @@ AIMS_BACKUP_FILES = {
 
 
 class UnconvergedErrorHandler(ErrorHandler):
-    """Check if a run is converged."""
+    """
+    Check if a run is converged.
+
+    An unconverged SCF cycle is corrected according to how its density change behaved (see
+    custodian.aims.utils.scf_profile):
+    - SLOW, still converging: more iterations, then a faster mixing, then a longer Pulay history;
+    - STALLED or OSCILLATING: the Kerker preconditioner, then a damped mixing, then more
+      iterations.
+    """
 
     is_monitor = False
 
@@ -63,27 +71,35 @@ class UnconvergedErrorHandler(ErrorHandler):
         actions = []
         errors = ["Unconverged"]
         if not out.get_image(-1).converged:
-            # Ladder of SCF settings, from the cheapest to the most conservative.
+            profile = scf_profile(out.get_image(-1).scf)
+            errors.append(profile.value)
+            limit = int(params.get("sc_iter_limit", 0))
+            # Without sc_iter_limit, FHI-aims may stop the SCF cycle early, at iteration 100
+            new_settings = {} if limit else {"sc_iter_limit": self.sc_iter_limit}
             # Setting charge_mix_param or spin_mix_param switches off adjust_scf: set both.
-            if "sc_iter_limit" not in params:
-                new_settings = {"sc_iter_limit": self.sc_iter_limit}
-            elif int(params.get("n_max_pulay", 8)) < 14:
-                new_settings = {"n_max_pulay": 14}
-            elif "preconditioner" not in params:
-                new_settings = {
-                    "preconditioner": "kerker 2.0",
-                    "charge_mix_param": 0.1,
-                    "spin_mix_param": 0.1,
-                    "prec_mix_param": 0.1,
-                }
-            elif (mix := float(params.get("charge_mix_param", 0.05))) > 0.02:
-                # While the Kerker preconditioner is on, FHI-aims mixes the charge with prec_mix_param
-                mix = max(mix / 2, 0.02)
-                new_settings = {"charge_mix_param": mix, "spin_mix_param": mix, "prec_mix_param": mix}
-            elif int(params["sc_iter_limit"]) < self.max_sc_iter_limit:
-                new_settings = {"sc_iter_limit": self.max_sc_iter_limit}
-            else:
-                new_settings = {}
+            if profile is ScfProfile.SLOW and limit:
+                if limit < self.max_sc_iter_limit:
+                    new_settings = {"sc_iter_limit": self.max_sc_iter_limit}
+                elif "charge_mix_param" not in params and "adjust_scf_param" not in params:
+                    # Twice the mixing adjust_scf picks for low-gap systems (0.02); 0.2 above the gap
+                    new_settings = {"adjust_scf_param": "lowgap charge_mix_param 0.04"}
+                elif int(params.get("n_max_pulay", 8)) < 14:
+                    new_settings = {"n_max_pulay": 14}
+            elif profile is not ScfProfile.SLOW:
+                if "preconditioner" not in params:
+                    new_settings.update(
+                        {
+                            "preconditioner": "kerker 2.0",
+                            "charge_mix_param": 0.1,
+                            "spin_mix_param": 0.1,
+                            "prec_mix_param": 0.1,
+                        }
+                    )
+                elif float(params.get("charge_mix_param", 0.05)) > 0.05:
+                    # While the Kerker preconditioner is on, FHI-aims mixes the charge with prec_mix_param
+                    new_settings.update({"charge_mix_param": 0.05, "spin_mix_param": 0.05, "prec_mix_param": 0.05})
+                elif limit < self.max_sc_iter_limit:
+                    new_settings["sc_iter_limit"] = self.max_sc_iter_limit
 
             if new_settings:
                 new_settings = {f"parameters->{key}": val for key, val in new_settings.items()}

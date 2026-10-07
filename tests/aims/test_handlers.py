@@ -6,6 +6,7 @@ from pyfhiaims.control.control import AimsControl
 
 from custodian.aims.handlers import UnconvergedErrorHandler
 from custodian.aims.interpreter import AimsModder
+from custodian.aims.utils import ScfProfile
 from custodian.utils import tracked_lru_cache
 from tests.conftest import TEST_FILES
 
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
 # Bulk Si (PBE, light) run with FHI-aims 260331_1: a converged SCF, an SCF stopped by
 # sc_iter_limit 3, and a relaxation stopped by max_relaxation_steps 1.
 KERKER = {"preconditioner": "kerker 2.0", "charge_mix_param": 0.1, "spin_mix_param": 0.1, "prec_mix_param": 0.1}
+LOWGAP = {"adjust_scf_param": "lowgap charge_mix_param 0.04"}
 
 
 @pytest.fixture(autouse=True)
@@ -37,42 +39,59 @@ class TestUnconvergedErrorHandler:
         assert not UnconvergedErrorHandler().check(directory=copy_files("static", tmp_path))
 
     @pytest.mark.parametrize(
-        ("modification", "expected"),
+        ("profile", "modification", "expected"),
         [
-            ({"_unset": {"parameters->sc_iter_limit": 1}}, {"sc_iter_limit": 300}),
-            ({}, {"n_max_pulay": 14}),
-            ({"_set": set_parameters({"n_max_pulay": 14})}, KERKER),
+            # still converging: more iterations, then a faster mixing, then a longer Pulay history
+            (ScfProfile.SLOW, {"_unset": {"parameters->sc_iter_limit": 1}}, {"sc_iter_limit": 300}),
+            (ScfProfile.SLOW, {}, {"sc_iter_limit": 1000}),
             (
-                {"_set": set_parameters({"n_max_pulay": 14, **KERKER})},
+                ScfProfile.SLOW,
+                {"_set": set_parameters({"sc_iter_limit": 1000})},
+                {"adjust_scf_param": "lowgap charge_mix_param 0.04"},
+            ),
+            (ScfProfile.SLOW, {"_set": set_parameters({"sc_iter_limit": 1000, **LOWGAP})}, {"n_max_pulay": 14}),
+            (ScfProfile.SLOW, {"_set": set_parameters({"sc_iter_limit": 1000, **LOWGAP, "n_max_pulay": 14})}, None),
+            # not converging: the Kerker preconditioner, then a damped mixing, then more iterations
+            (ScfProfile.STALLED, {"_unset": {"parameters->sc_iter_limit": 1}}, {"sc_iter_limit": 300, **KERKER}),
+            (ScfProfile.OSCILLATING, {}, KERKER),
+            (
+                ScfProfile.STALLED,
+                {"_set": set_parameters(KERKER)},
                 {"charge_mix_param": 0.05, "spin_mix_param": 0.05, "prec_mix_param": 0.05},
             ),
             (
-                {"_set": set_parameters({"n_max_pulay": 14, **KERKER, "charge_mix_param": 0.02})},
+                ScfProfile.OSCILLATING,
+                {"_set": set_parameters({**KERKER, "charge_mix_param": 0.05})},
                 {"sc_iter_limit": 1000},
             ),
             (
-                {
-                    "_set": set_parameters(
-                        {"n_max_pulay": 14, **KERKER, "charge_mix_param": 0.02, "sc_iter_limit": 1000}
-                    )
-                },
+                ScfProfile.STALLED,
+                {"_set": set_parameters({**KERKER, "charge_mix_param": 0.05, "sc_iter_limit": 1000})},
                 None,
             ),
         ],
     )
-    def test_check_correct_electronic(self, tmp_path: "Path", modification: dict, expected: dict | None) -> None:
+    def test_check_correct_electronic(
+        self,
+        tmp_path: "Path",
+        monkeypatch: pytest.MonkeyPatch,
+        profile: ScfProfile,
+        modification: dict,
+        expected: dict | None,
+    ) -> None:
         directory = copy_files("scf_unconverged", tmp_path)
         if modification:
             AimsModder(directory=directory).apply_actions([{"dict": "control.in", "action": modification}])
+        monkeypatch.setattr("custodian.aims.handlers.scf_profile", lambda scf_steps: profile)
 
         handler = UnconvergedErrorHandler()
         assert handler.check(directory=directory)
         dct = handler.correct(directory=directory)
         if expected is None:
-            assert dct == {"errors": ["Unconverged"], "actions": None}
+            assert dct == {"errors": ["Unconverged", profile.value], "actions": None}
             return
         assert dct == {
-            "errors": ["Unconverged"],
+            "errors": ["Unconverged", profile.value],
             "actions": [{"dict": "control.in", "action": {"_set": set_parameters(expected)}}],
         }
         parameters = AimsControl.from_file(f"{directory}/control.in").parameters
