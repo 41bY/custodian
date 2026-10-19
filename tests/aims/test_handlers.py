@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import pytest
 from pyfhiaims.control.control import AimsControl
 
-from custodian.aims.handlers import UnconvergedErrorHandler
+from custodian.aims.handlers import RoundChargeErrorHandler, UnconvergedErrorHandler
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.utils import ScfProfile
 from custodian.utils import tracked_lru_cache
@@ -14,7 +14,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 # Bulk Si (PBE, light) run with FHI-aims 260331_1: a converged SCF, an SCF stopped by
-# sc_iter_limit 3, and a relaxation stopped by max_relaxation_steps 1.
+# sc_iter_limit 3, and a relaxation stopped by max_relaxation_steps 1. With FHI-aims 261002:
+# a run stopped by initial charges adding up to 1.2e-5, and its rerun with
+# override_initial_charge_check.
 KERKER = {"preconditioner": "kerker 2.0", "charge_mix_param": 0.1, "spin_mix_param": 0.1, "prec_mix_param": 0.1}
 LOWGAP = {"adjust_scf_param": "lowgap charge_mix_param 0.04"}
 
@@ -108,3 +110,35 @@ class TestUnconvergedErrorHandler:
             "actions": [{"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}}],
         }
         assert (tmp_path / "geometry.in").read_text() == (tmp_path / "geometry.in.next_step").read_text()
+
+
+class TestRoundChargeErrorHandler:
+    @pytest.mark.parametrize("killed", [False, True])
+    def test_check_override(self, tmp_path: "Path", killed: bool) -> None:
+        # With override_initial_charge_check, FHI-aims reports the mismatch as a warning. A run
+        # killed right after it leaves the warning as the last block of aims.out, like an error.
+        directory = copy_files("initial_charge_override", tmp_path)
+        if killed:
+            output = (tmp_path / "aims.out").read_text()
+            (tmp_path / "aims.out").write_text(output[: output.index("  Number of empty states per atom")])
+        assert not RoundChargeErrorHandler().check(directory=directory)
+
+    @pytest.mark.parametrize(
+        ("charge_tol", "actions"),
+        [
+            (1e-3, [{"dict": "control.in", "action": {"_set": {"parameters->override_initial_charge_check": True}}}]),
+            # The initial charges add up to 1.2e-5: beyond this tolerance it is not rounding
+            (1e-6, None),
+        ],
+    )
+    def test_check_correct(self, tmp_path: "Path", charge_tol: float, actions: list | None) -> None:
+        directory = copy_files("initial_charge", tmp_path)
+        geometry = (tmp_path / "geometry.in").read_text()
+
+        handler = RoundChargeErrorHandler(charge_tol=charge_tol)
+        assert handler.check(directory=directory)
+        assert handler.correct(directory=directory) == {"errors": ["RoundCharge"], "actions": actions}
+        parameters = AimsControl.from_file(f"{directory}/control.in").parameters
+        assert parameters.get("override_initial_charge_check") == (".true." if actions else None)
+        assert (tmp_path / "geometry.in").read_text() == geometry
+        assert (tmp_path / "error.1.tar.gz").is_file() is bool(actions)
