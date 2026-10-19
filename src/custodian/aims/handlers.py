@@ -7,6 +7,7 @@ by modifying the input files.
 import os
 
 from pyfhiaims.control.control import AimsControl
+from pyfhiaims.geometry.geometry import AimsGeometry
 
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.io import load_aims_stdout
@@ -120,3 +121,58 @@ class UnconvergedErrorHandler(ErrorHandler):
 
         # Unfixable error. Just return None for actions.
         return {"errors": errors, "actions": None}
+
+
+class RoundChargeErrorHandler(ErrorHandler):
+    """
+    Check if FHI-aims stopped because the initial charges in geometry.in do not add up to the
+    charge in control.in, which it requires within 1e-5.
+
+    Initial charges taken from a previous run, e.g. its Mulliken charges, are rounded: summed
+    over many atoms, they can miss the charge by that much. Within charge_tol the mismatch is
+    taken as rounding, so the charges are kept and the check is overridden; a larger one is an
+    input error and is not corrected.
+    """
+
+    is_monitor = False
+
+    def __init__(self, output_filename: str = "aims.out", charge_tol: float = 1e-3) -> None:
+        """Initialize the handler with the output file to check.
+
+        Args:
+            output_filename (str): Filename for the FHI-aims output. Change
+                this only if it is different from the default (unlikely).
+            charge_tol (float): Largest mismatch between the sum of the initial charges and
+                the charge of the system that is taken as rounding. Defaults to 1e-3.
+        """
+        self.output_filename = output_filename
+        self.charge_tol = charge_tol
+
+    def check(self, directory="./") -> bool:
+        """Check for error."""
+        msg = "Error: Initial charge and total charge of the system are inconsistent."
+        try:
+            out = load_aims_stdout(os.path.join(directory, self.output_filename))
+            if any(msg in error for error in out.errors):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def correct(self, directory="./"):
+        """Perform corrections."""
+        charge = float(AimsControl.from_file(os.path.join(directory, "control.in")).parameters.get("charge", 0))
+        initial_charges = AimsGeometry.from_file(os.path.join(directory, "geometry.in")).initial_charges or []
+        actions = []
+        if abs(sum(initial_charges) - charge) <= self.charge_tol:
+            actions.append(
+                {"dict": "control.in", "action": {"_set": {"parameters->override_initial_charge_check": True}}}
+            )
+
+        if actions:
+            backup(AIMS_BACKUP_FILES, directory=directory)
+            AimsModder(directory=directory).apply_actions(actions)
+            return {"errors": ["RoundCharge"], "actions": actions}
+
+        # Unfixable error. Just return None for actions.
+        return {"errors": ["RoundCharge"], "actions": None}
