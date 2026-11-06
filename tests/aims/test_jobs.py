@@ -85,6 +85,27 @@ class TestAimsJob:
         assert geometry.is_file()
         assert (static_dir / "geometry.in.orig").is_file()
 
+    def test_setup_auto_continue(self, tmp_path: "Path") -> None:
+        shutil.copytree(f"{TEST_FILES}/aims/relax_max_steps", tmp_path, dirs_exist_ok=True)
+        job = AimsJob(FAKE_AIMS, auto_continue=True)
+        job.setup(directory=str(tmp_path))
+        assert (tmp_path / "continue.json").is_file()
+
+        # started again in the same directory, e.g. after the wall time
+        job.setup(directory=str(tmp_path))
+        assert (tmp_path / "geometry.in").read_text() == (tmp_path / "geometry.in.next_step").read_text()
+        assert (tmp_path / "prev_run.1.tar.gz").is_file()
+
+        job.postprocess(directory=str(tmp_path))
+        assert not (tmp_path / "continue.json").exists()
+
+    def test_setup_auto_continue_before_first_step(self, static_dir: "Path") -> None:
+        geometry = (static_dir / "geometry.in").read_text()
+        job = AimsJob(FAKE_AIMS, auto_continue=True)
+        job.setup(directory=str(static_dir))
+        job.setup(directory=str(static_dir))
+        assert (static_dir / "geometry.in").read_text() == geometry
+
     def test_run_redirects_streams(self, static_dir: "Path") -> None:
         job = AimsJob(FAKE_AIMS)
         process = job.run(directory=str(static_dir))

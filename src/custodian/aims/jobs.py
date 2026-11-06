@@ -10,10 +10,13 @@ import signal
 import subprocess
 from typing import TYPE_CHECKING
 
+from monty.serialization import dumpfn, loadfn
 from monty.shutil import decompress_dir
 
+from custodian.aims.handlers import AIMS_BACKUP_FILES
 from custodian.aims.interpreter import AimsModder
 from custodian.custodian import Job
+from custodian.utils import backup
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -43,6 +46,7 @@ class AimsJob(Job):
         final: bool = True,
         backup: bool = True,
         settings_override: list[dict] | None = None,
+        auto_continue: bool | list[dict] = False,
         terminate_timeout: float = 10.0,
     ) -> None:
         """
@@ -67,6 +71,11 @@ class AimsJob(Job):
                 to restart a relaxation from its last geometry, provide
                 [{"dict": "control.in", "action": {"_set": {"parameters->sc_iter_limit": 300}}},
                 {"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}}].
+            auto_continue (bool | [dict]): Whether to continue a run that was stopped, e.g. by
+                the wall time, when it is started again in the same directory. If True, a
+                relaxation goes on from its last geometry (geometry.in.next_step, which points
+                to hessian.aims); a list of actions replaces this default. Actions on files that
+                do not exist, e.g. of a relaxation stopped before its first step, are skipped.
             terminate_timeout (float): Timeout in seconds to wait for graceful termination
                 (SIGTERM) before escalating to SIGKILL. Defaults to 10.0 seconds.
         """
@@ -77,18 +86,37 @@ class AimsJob(Job):
         self.final = final
         self.backup = backup
         self.settings_override = settings_override
+        self.auto_continue = auto_continue
         self.terminate_timeout = terminate_timeout
 
     def setup(self, directory: str = "./") -> None:
         """
         Performs initial setup for AimsJob: decompresses the directory, backs up the
-        inputs and applies settings_override.
+        inputs, continues a stopped run (auto_continue) and applies settings_override.
         """
         decompress_dir(directory)
 
         if self.backup:
             for file in AIMS_INPUT_FILES:
                 shutil.copy(os.path.join(directory, file), os.path.join(directory, f"{file}.orig"))
+
+        if self.auto_continue:
+            if os.path.isfile(os.path.join(directory, "continue.json")):
+                actions = loadfn(os.path.join(directory, "continue.json")).get("actions")
+                # A relaxation stopped before its first step left no geometry.in.next_step
+                actions = [a for a in actions if "file" not in a or os.path.isfile(os.path.join(directory, a["file"]))]
+                logger.info(f"Continuing previous AimsJob. Actions: {actions}")
+                backup(AIMS_BACKUP_FILES, prefix="prev_run", directory=directory)
+                AimsModder(directory=directory).apply_actions(actions)
+
+            else:
+                # Default functionality is to continue a relaxation from its last
+                # geometry, but other actions can be specified
+                if self.auto_continue is True:
+                    actions = [{"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}}]
+                else:
+                    actions = self.auto_continue
+                dumpfn({"actions": actions}, os.path.join(directory, "continue.json"))
 
         if self.settings_override is not None:
             AimsModder(directory=directory).apply_actions(self.settings_override)
@@ -121,6 +149,11 @@ class AimsJob(Job):
                     shutil.move(file, f"{file}{self.suffix}")
                 elif self.suffix != "":
                     shutil.copy(file, f"{file}{self.suffix}")
+
+        # Remove continuation so if a subsequent job is run in
+        # the same directory, will not restart this job.
+        if os.path.isfile(os.path.join(directory, "continue.json")):
+            os.remove(os.path.join(directory, "continue.json"))
 
     def terminate(self, directory: str = "./") -> None:
         """Kill all FHI-aims processes associated with the current job.
