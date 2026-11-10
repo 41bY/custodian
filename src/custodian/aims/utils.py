@@ -18,6 +18,24 @@ class ScfProfile(str, Enum):
     OSCILLATING = "oscillating"
 
 
+def density_change(scf_steps: list[dict]) -> np.ndarray:
+    """The larger of the charge and spin density changes at each SCF iteration, in log10.
+
+    Args:
+        scf_steps: The SCF iterations, as parsed by pyfhiaims. Those without a density change,
+            e.g. one still being written, are skipped.
+
+    Returns:
+        np.ndarray: log10 of the density change, one value per iteration.
+    """
+    changes = [
+        max(s["charge_density_change"], s.get("spin_density_change", 0))
+        for s in scf_steps
+        if "charge_density_change" in s
+    ]
+    return np.log10(np.maximum(changes, 1e-15))
+
+
 def scf_profile(scf_steps: list[dict]) -> ScfProfile:
     """Classify an unconverged SCF cycle from the change of the density at each iteration.
 
@@ -35,12 +53,7 @@ def scf_profile(scf_steps: list[dict]) -> ScfProfile:
     Returns:
         ScfProfile: The category.
     """
-    changes = [
-        max(s["charge_density_change"], s.get("spin_density_change", 0))
-        for s in scf_steps
-        if "charge_density_change" in s
-    ]
-    rho = np.log10(np.maximum(changes, 1e-15))
+    rho = density_change(scf_steps)
     smooth = np.convolve(rho, np.ones(9) / 9, mode="valid")
     if len(smooth) < 10:  # too few iterations to tell
         return ScfProfile.SLOW

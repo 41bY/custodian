@@ -1,10 +1,12 @@
+import gzip
+import re
 import shutil
 from typing import TYPE_CHECKING
 
 import pytest
 from pyfhiaims.control.control import AimsControl
 
-from custodian.aims.handlers import RoundChargeErrorHandler, UnconvergedErrorHandler
+from custodian.aims.handlers import RoundChargeErrorHandler, ScfMonitorHandler, UnconvergedErrorHandler
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.utils import ScfProfile
 from custodian.utils import tracked_lru_cache
@@ -15,10 +17,12 @@ if TYPE_CHECKING:
 
 # Bulk Si (PBE, light) run with FHI-aims 260331_1: a converged SCF, an SCF stopped by
 # sc_iter_limit 3, and a relaxation stopped by max_relaxation_steps 1. With FHI-aims 261002:
-# a run stopped by initial charges adding up to 1.2e-5, and its rerun with
-# override_initial_charge_check.
+# a run stopped by initial charges adding up to 1.2e-5, its rerun with
+# override_initial_charge_check, and the stalled SCF cycle of a magnetic ordering of a
+# phyllosilicate (r2SCAN, Kerker, mixing 0.1) stopped with abort_scf after 102 iterations.
 KERKER = {"preconditioner": "kerker 2.0", "charge_mix_param": 0.1, "spin_mix_param": 0.1, "prec_mix_param": 0.1}
 LOWGAP = {"adjust_scf_param": "lowgap charge_mix_param 0.04"}
+DAMPED = {"charge_mix_param": 0.05, "spin_mix_param": 0.05, "prec_mix_param": 0.05}
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +38,17 @@ def copy_files(name: str, tmp_path: "Path") -> str:
 
 def set_parameters(parameters: dict) -> dict:
     return {f"parameters->{key}": val for key, val in parameters.items()}
+
+
+def aborted_run(tmp_path: "Path", n_iterations: int | None = None) -> str:
+    """The SCF cycle stopped with abort_scf, or cut while it runs, after n_iterations."""
+    directory = copy_files("scf_aborted", tmp_path)
+    output = gzip.decompress((tmp_path / "aims.out.gz").read_bytes()).decode()
+    if n_iterations is not None:
+        ends = [match.end() for match in re.finditer(r"End self-consistency iteration.*\n", output)]
+        output = output[: ends[n_iterations - 1] + 1000]  # with the start of the next iteration
+    (tmp_path / "aims.out").write_text(output)
+    return directory
 
 
 class TestUnconvergedErrorHandler:
@@ -56,11 +71,7 @@ class TestUnconvergedErrorHandler:
             # not converging: the Kerker preconditioner, then a damped mixing, then more iterations
             (ScfProfile.STALLED, {"_unset": {"parameters->sc_iter_limit": 1}}, {"sc_iter_limit": 300, **KERKER}),
             (ScfProfile.OSCILLATING, {}, KERKER),
-            (
-                ScfProfile.STALLED,
-                {"_set": set_parameters(KERKER)},
-                {"charge_mix_param": 0.05, "spin_mix_param": 0.05, "prec_mix_param": 0.05},
-            ),
+            (ScfProfile.STALLED, {"_set": set_parameters(KERKER)}, DAMPED),
             (
                 ScfProfile.OSCILLATING,
                 {"_set": set_parameters({**KERKER, "charge_mix_param": 0.05})},
@@ -100,6 +111,16 @@ class TestUnconvergedErrorHandler:
         assert {key: parameters[key] for key in expected} == {key: str(val) for key, val in expected.items()}
         assert (tmp_path / "error.1.tar.gz").is_file()
 
+    def test_check_correct_aborted(self, tmp_path: "Path") -> None:
+        # The run stopped by ScfMonitorHandler is corrected as any unconverged SCF cycle
+        directory = aborted_run(tmp_path)
+        handler = UnconvergedErrorHandler()
+        assert handler.check(directory=directory)
+        assert handler.correct(directory=directory) == {
+            "errors": ["Unconverged", ScfProfile.STALLED.value],
+            "actions": [{"dict": "control.in", "action": {"_set": set_parameters(DAMPED)}}],
+        }
+
     def test_check_correct_ionic(self, tmp_path: "Path") -> None:
         directory = copy_files("relax_max_steps", tmp_path)
         handler = UnconvergedErrorHandler()
@@ -110,6 +131,66 @@ class TestUnconvergedErrorHandler:
             "actions": [{"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}}],
         }
         assert (tmp_path / "geometry.in").read_text() == (tmp_path / "geometry.in.next_step").read_text()
+
+
+class TestScfMonitorHandler:
+    def test_settings_override(self) -> None:
+        settings = {"sc_iter_limit": 1000, "elsi_restart": "read_and_write 100"}
+        assert ScfMonitorHandler().settings_override == [
+            {"dict": "control.in", "action": {"_set": set_parameters(settings)}}
+        ]
+        # without restarts, no density matrices are written
+        assert ScfMonitorHandler(rel_accuracy_residue=None).settings_override == [
+            {"dict": "control.in", "action": {"_set": set_parameters({"sc_iter_limit": 1000})}}
+        ]
+
+    @pytest.mark.parametrize(
+        ("n_iterations", "profile", "stopping", "expected"),
+        [
+            (100, None, False, False),  # before the first checkpoint, iteration 101
+            (101, None, False, True),  # stalled at the checkpoint
+            (101, ScfProfile.SLOW, False, False),  # still converging
+            (101, None, True, False),  # abort_scf already written
+            (None, None, False, False),  # FHI-aims has stopped: UnconvergedErrorHandler takes over
+        ],
+    )
+    def test_check(
+        self,
+        tmp_path: "Path",
+        monkeypatch: pytest.MonkeyPatch,
+        n_iterations: int | None,
+        profile: ScfProfile | None,
+        stopping: bool,
+        expected: bool,
+    ) -> None:
+        directory = aborted_run(tmp_path, n_iterations)
+        if profile is not None:
+            monkeypatch.setattr("custodian.aims.handlers.scf_profile", lambda scf_steps: profile)
+        if stopping:
+            (tmp_path / "abort_scf").touch()
+        assert ScfMonitorHandler().check(directory=directory) is expected
+
+    @pytest.mark.parametrize(
+        ("rel_accuracy_residue", "restart"),
+        # the density change at the checkpoint is 15 times sc_accuracy_rho
+        [(100, True), (10, False)],
+    )
+    def test_correct(self, tmp_path: "Path", rel_accuracy_residue: float, restart: bool) -> None:
+        directory = aborted_run(tmp_path, 101)
+        for spin in (1, 2):
+            (tmp_path / f"D_spin_0{spin}_kpt_000001.csc").touch()
+
+        handler = ScfMonitorHandler(rel_accuracy_residue=rel_accuracy_residue)
+        assert handler.check(directory=directory)
+        actions = [{"file": "abort_scf", "action": {"_file_create": {"content": ""}}}]
+        if not restart:
+            actions.append({"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}})
+        assert handler.correct(directory=directory) == {
+            "errors": ["Non-converging SCF", ScfProfile.STALLED.value],
+            "actions": actions,
+        }
+        assert (tmp_path / "abort_scf").is_file()
+        assert len(list(tmp_path.glob("D_spin_*.csc"))) == (2 if restart else 0)
 
 
 class TestRoundChargeErrorHandler:

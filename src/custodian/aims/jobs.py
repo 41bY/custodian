@@ -8,10 +8,12 @@ import shlex
 import shutil
 import signal
 import subprocess
+from glob import glob
 from typing import TYPE_CHECKING
 
 from monty.serialization import dumpfn, loadfn
 from monty.shutil import decompress_dir
+from pyfhiaims.control.control import AimsControl
 
 from custodian.aims.handlers import AIMS_BACKUP_FILES
 from custodian.aims.interpreter import AimsModder
@@ -128,6 +130,11 @@ class AimsJob(Job):
         Returns:
             (subprocess.Popen) Used for monitoring.
         """
+        # FHI-aims does not remove the abort_scf of ScfMonitorHandler (VASP removes its STOPCAR):
+        # left in place, it would stop this run at its first SCF iteration
+        if os.path.isfile(os.path.join(directory, "abort_scf")):
+            os.remove(os.path.join(directory, "abort_scf"))
+
         cmd = list(self.aims_cmd)
         logger.info(f"Running {' '.join(cmd)}")
         with (
@@ -154,6 +161,18 @@ class AimsJob(Job):
         # the same directory, will not restart this job.
         if os.path.isfile(os.path.join(directory, "continue.json")):
             os.remove(os.path.join(directory, "continue.json"))
+
+        # Remove the density matrices written for the restarts of ScfMonitorHandler, unless the
+        # original control.in asked for them (elsi_restart write or read_and_write)
+        density_matrices = glob("D_spin_*.csc", root_dir=directory)
+        original = os.path.join(directory, "control.in.orig")
+        if (
+            density_matrices
+            and os.path.isfile(original)
+            and "write" not in AimsControl.from_file(original).parameters.get("elsi_restart", "")
+        ):
+            for file in density_matrices:
+                os.remove(os.path.join(directory, file))
 
     def terminate(self, directory: str = "./") -> None:
         """Kill all FHI-aims processes associated with the current job.
