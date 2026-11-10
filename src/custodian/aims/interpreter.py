@@ -59,7 +59,8 @@ class AimsModder(Modder):
                 pattern = action["file"]
                 files = sorted(glob(pattern, root_dir=self.directory)) if set("*?[") & set(pattern) else [pattern]
                 for file in files:
-                    # Full path: FileActions.file_create opens the file name as given, ignoring the directory
+                    # TODO(41bY): FileActions.file_create of custodian opens the file name as given,
+                    # ignoring the directory: pass the full path until it is fixed upstream
                     self.modify(action["action"], os.path.abspath(os.path.join(self.directory, file)))
             else:
                 raise ValueError(f"Unrecognized format: {action}")

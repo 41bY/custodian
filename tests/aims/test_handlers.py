@@ -13,6 +13,7 @@ from custodian.utils import tracked_lru_cache
 from tests.conftest import TEST_FILES
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 # Bulk Si (PBE, light) run with FHI-aims 260331_1: a converged SCF, an SCF stopped by
@@ -111,13 +112,30 @@ class TestUnconvergedErrorHandler:
         assert {key: parameters[key] for key in expected} == {key: str(val) for key, val in expected.items()}
         assert (tmp_path / "error.1.tar.gz").is_file()
 
-    def test_check_correct_aborted(self, tmp_path: "Path") -> None:
-        # The run stopped by ScfMonitorHandler is corrected as any unconverged SCF cycle
+    @pytest.mark.parametrize(
+        ("stopped_for", "profile"),
+        [
+            (None, ScfProfile.STALLED),  # abort_scf written by hand: the cycle is profiled
+            # Stopped by ScfMonitorHandler while oscillating: the iterations FHI-aims did after
+            # must not turn it into SLOW, for which no remedy is left
+            (ScfProfile.OSCILLATING, ScfProfile.OSCILLATING),
+        ],
+    )
+    def test_check_correct_aborted(
+        self,
+        tmp_path: "Path",
+        monkeypatch: pytest.MonkeyPatch,
+        stopped_for: ScfProfile | None,
+        profile: ScfProfile,
+    ) -> None:
         directory = aborted_run(tmp_path)
+        (tmp_path / "abort_scf").write_text(stopped_for.value if stopped_for else "")
+        if stopped_for:
+            monkeypatch.setattr("custodian.aims.handlers.scf_profile", lambda scf_steps: ScfProfile.SLOW)
         handler = UnconvergedErrorHandler()
         assert handler.check(directory=directory)
         assert handler.correct(directory=directory) == {
-            "errors": ["Unconverged", ScfProfile.STALLED.value],
+            "errors": ["Unconverged", profile.value],
             "actions": [{"dict": "control.in", "action": {"_set": set_parameters(DAMPED)}}],
         }
 
@@ -145,11 +163,13 @@ class TestScfMonitorHandler:
         ]
 
     @pytest.mark.parametrize(
-        ("n_iterations", "profile", "stopping", "expected"),
+        ("n_iterations", "classify", "stopping", "expected"),
         [
             (100, None, False, False),  # before the first checkpoint, iteration 101
             (101, None, False, True),  # stalled at the checkpoint
-            (101, ScfProfile.SLOW, False, False),  # still converging
+            (101, lambda scf_steps: ScfProfile.SLOW, False, False),  # still converging
+            # stalled at the checkpoint, but converging with the iteration done since
+            (102, lambda scf_steps: ScfProfile.STALLED if len(scf_steps) <= 101 else ScfProfile.SLOW, False, False),
             (101, None, True, False),  # abort_scf already written
             (None, None, False, False),  # FHI-aims has stopped: UnconvergedErrorHandler takes over
         ],
@@ -159,13 +179,13 @@ class TestScfMonitorHandler:
         tmp_path: "Path",
         monkeypatch: pytest.MonkeyPatch,
         n_iterations: int | None,
-        profile: ScfProfile | None,
+        classify: "Callable[[list[dict]], ScfProfile] | None",
         stopping: bool,
         expected: bool,
     ) -> None:
         directory = aborted_run(tmp_path, n_iterations)
-        if profile is not None:
-            monkeypatch.setattr("custodian.aims.handlers.scf_profile", lambda scf_steps: profile)
+        if classify is not None:
+            monkeypatch.setattr("custodian.aims.handlers.scf_profile", classify)
         if stopping:
             (tmp_path / "abort_scf").touch()
         assert ScfMonitorHandler().check(directory=directory) is expected
@@ -182,7 +202,7 @@ class TestScfMonitorHandler:
 
         handler = ScfMonitorHandler(rel_accuracy_residue=rel_accuracy_residue)
         assert handler.check(directory=directory)
-        actions = [{"file": "abort_scf", "action": {"_file_create": {"content": ""}}}]
+        actions = [{"file": "abort_scf", "action": {"_file_create": {"content": ScfProfile.STALLED.value}}}]
         if not restart:
             actions.append({"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}})
         assert handler.correct(directory=directory) == {

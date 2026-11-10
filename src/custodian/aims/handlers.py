@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from glob import glob
+from pathlib import Path
 
 from pyfhiaims.control.control import AimsControl
 from pyfhiaims.geometry.geometry import AimsGeometry
@@ -82,7 +83,14 @@ class UnconvergedErrorHandler(ErrorHandler):
         actions = []
         errors = ["Unconverged"]
         if not out.get_image(-1).converged:
-            profile = scf_profile(out.get_image(-1).scf)
+            # A cycle stopped by ScfMonitorHandler is corrected for the profile it was stopped for
+            # (written in abort_scf), not reclassified with the few iterations FHI-aims did after
+            abort = Path(directory, "abort_scf")
+            stopped = abort.read_text().strip() if abort.is_file() else ""
+            if stopped in {p.value for p in ScfProfile}:
+                profile = ScfProfile(stopped)
+            else:
+                profile = scf_profile(out.get_image(-1).scf)
             errors.append(profile.value)
             limit = int(params.get("sc_iter_limit", 0))
             # Without sc_iter_limit, FHI-aims may stop the SCF cycle early, at iteration 100
@@ -205,14 +213,18 @@ class ScfMonitorHandler(ErrorHandler):
             return False
         try:
             steps, checkpoint = self._checkpoint(directory)
-            return checkpoint > 0 and scf_profile(steps[:checkpoint]) is not ScfProfile.SLOW
+            # Not converging at the checkpoint, the density matrices the next run restarts from,
+            # and still not converging with all the iterations done since
+            return checkpoint > 0 and all(scf_profile(s) is not ScfProfile.SLOW for s in (steps[:checkpoint], steps))
         except Exception:
             return False
 
     def correct(self, directory="./"):
         """Perform corrections."""
         steps, checkpoint = self._checkpoint(directory)
-        actions = [{"file": "abort_scf", "action": {"_file_create": {"content": ""}}}]
+        profile = scf_profile(steps)
+        # FHI-aims only checks that abort_scf exists: its content tells UnconvergedErrorHandler why
+        actions = [{"file": "abort_scf", "action": {"_file_create": {"content": profile.value}}}]
         if self.rel_accuracy_residue is not None:
             if not glob("D_spin_*.csc", root_dir=directory):
                 logger.warning("No density matrices to restart from: pass settings_override to AimsJob")
@@ -226,7 +238,7 @@ class ScfMonitorHandler(ErrorHandler):
                     actions.append({"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}})
 
         AimsModder(directory=directory).apply_actions(actions)
-        return {"errors": ["Non-converging SCF", scf_profile(steps[:checkpoint]).value], "actions": actions}
+        return {"errors": ["Non-converging SCF", profile.value], "actions": actions}
 
 
 class RoundChargeErrorHandler(ErrorHandler):
