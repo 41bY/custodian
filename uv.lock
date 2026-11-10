@@ -594,6 +594,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+aims = [
+    { name = "pyfhiaims" },
+]
 error-statistics = [
     { name = "sentry-sdk" },
 ]
@@ -631,12 +634,13 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'gaussian'" },
     { name = "monty", specifier = ">=2026.7.16" },
     { name = "psutil" },
+    { name = "pyfhiaims", marker = "extra == 'aims'", specifier = ">=1.2" },
     { name = "pymatgen", marker = "extra == 'gaussian'" },
     { name = "pymatgen", marker = "extra == 'matsci'" },
     { name = "ruamel-yaml", specifier = ">=0.15.6" },
     { name = "sentry-sdk", marker = "extra == 'error-statistics'", specifier = ">=0.8.0" },
 ]
-provides-extras = ["matsci", "gaussian", "error-statistics"]
+provides-extras = ["matsci", "gaussian", "aims", "error-statistics"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2094,6 +2098,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/04/78/0acd37ca84ce3ddffaa92ef0f571e073faa6d8ff1f0559ab1272188ea2be/psutil-7.2.2-cp36-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:b58fabe35e80b264a4e3bb23e6b96f9e45a3df7fb7eed419ac0e5947c61e47cc", size = 148266, upload-time = "2026-01-28T18:15:31.597Z" },
     { url = "https://files.pythonhosted.org/packages/b4/90/e2159492b5426be0c1fef7acba807a03511f97c5f86b3caeda6ad92351a7/psutil-7.2.2-cp37-abi3-win_amd64.whl", hash = "sha256:eb7e81434c8d223ec4a219b5fc1c47d0417b12be7ea866e24fb5ad6e84b3d988", size = 137737, upload-time = "2026-01-28T18:15:33.849Z" },
     { url = "https://files.pythonhosted.org/packages/8c/c7/7bb2e321574b10df20cbde462a94e2b71d05f9bbda251ef27d104668306a/psutil-7.2.2-cp37-abi3-win_arm64.whl", hash = "sha256:8c233660f575a5a89e6d4cb65d9f938126312bca76d8fe087b947b3a1aaac9ee", size = 134617, upload-time = "2026-01-28T18:15:36.514Z" },
+]
+
+[[package]]
+name = "pyfhiaims"
+version = "1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "monty" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/19/18/86012858afc45b70a87ea8d29c1bd8f15c74ebcefee2af806875f7762180/pyfhiaims-1.2.tar.gz", hash = "sha256:28e53d6457b578762e7d7af2c3f1cda5f886b837469f3b1ccad2cd06a207ed6f", size = 80003, upload-time = "2026-09-18T12:58:58.767Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/3b/b039234ddd517bd938043051937408185979589385e31bda848505b2bcbd/pyfhiaims-1.2-py3-none-any.whl", hash = "sha256:7ab540cdf6980cf524417763b3e321467cd23dc7d6c9698d0b426c7d0398088d", size = 91949, upload-time = "2026-09-18T12:58:57.061Z" },
 ]
 
 [[package]]
