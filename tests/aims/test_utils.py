@@ -17,6 +17,7 @@ PLATEAU = np.maximum(-0.05 * ITERATIONS, -2)  # 2 decades in 40 iterations, then
         (PLATEAU + 0.3 * (-1) ** ITERATIONS, None, ScfProfile.OSCILLATING),
         (np.zeros(200), None, ScfProfile.OSCILLATING),  # it never went down
         (DECREASING[:15], None, ScfProfile.SLOW),  # too few iterations to tell
+        (DECREASING[:0], None, ScfProfile.SLOW),  # no iteration yet
     ],
 )
 def test_scf_profile(log_charge, log_spin, expected) -> None:

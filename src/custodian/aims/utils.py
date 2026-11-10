@@ -54,9 +54,9 @@ def scf_profile(scf_steps: list[dict]) -> ScfProfile:
         ScfProfile: The category.
     """
     rho = density_change(scf_steps)
-    smooth = np.convolve(rho, np.ones(9) / 9, mode="valid")
-    if len(smooth) < 10:  # too few iterations to tell
+    if len(rho) < 18:  # too few iterations to tell (fewer than 10 smoothed points), or none at all
         return ScfProfile.SLOW
+    smooth = np.convolve(rho, np.ones(9) / 9, mode="valid")
     half = len(smooth) // 2
     if np.polyfit(np.arange(len(smooth) - half), smooth[half:], 1)[0] < -1e-3:
         return ScfProfile.SLOW
