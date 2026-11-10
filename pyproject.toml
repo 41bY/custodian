@@ -52,6 +52,9 @@ matsci = [
     "pymatgen",
 ] # Error handlers and jobs for materials simulations, e.g., VASP, Nwchem, qchem, etc.
 gaussian = ["matplotlib", "pymatgen"]
+# Before 1.2, pyfhiaims truncates fractional occupations (e.g. "ion_occ 1 s 0.5" of H) when it
+# rewrites control.in, which the aims handlers and AimsJob(settings_override) do
+aims = ["pyfhiaims>=1.2"]
 error-statistics = ["sentry-sdk>=0.8.0"]
 
 [project.scripts]

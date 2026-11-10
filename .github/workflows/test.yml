@@ -43,7 +43,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          uv pip install -e . --system
+          uv pip install -e '.[aims]' --system
           uv pip install pytest pymatgen pytest-cov --system
 
       - name: pytest
