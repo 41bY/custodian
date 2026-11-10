@@ -145,13 +145,15 @@ class ScfMonitorHandler(ErrorHandler):
     """
     Monitor the SCF cycle while FHI-aims runs, and stop it when it is not converging.
 
-    Every checkpoint_interval iterations (at iteration checkpoint_interval + 1, 2 * checkpoint_interval
-    + 1, ..., where "elsi_restart read_and_write checkpoint_interval" writes the density matrices),
-    the SCF cycle up to that iteration is classified with custodian.aims.utils.scf_profile. If it is
-    not SLOW, the handler writes abort_scf, on which FHI-aims stops at the end of the iteration in
-    progress, and UnconvergedErrorHandler corrects the stopped run. The next run restarts from the
-    density matrices of the checkpoint, unless its density change is above rel_accuracy_residue
-    times sc_accuracy_rho: then they are deleted, and the next run starts from scratch.
+    Checkpoints come every checkpoint_interval iterations (at iteration checkpoint_interval + 1,
+    2 * checkpoint_interval + 1, ..., where "elsi_restart read_and_write checkpoint_interval" writes
+    the density matrices). Once a checkpoint is passed, the SCF cycle is classified with
+    custodian.aims.utils.scf_profile up to the checkpoint and over the last checkpoint_interval
+    iterations. If neither is SLOW, the handler writes abort_scf, on which FHI-aims stops at the end
+    of the iteration in progress, and UnconvergedErrorHandler corrects the stopped run. The next run
+    restarts from the density matrices of the checkpoint, unless its density change is above
+    rel_accuracy_residue times sc_accuracy_rho: then they are deleted, and the next run starts from
+    scratch.
 
     Unlike NonConvergingErrorHandler for VASP, which terminates a run whose last ionic steps all hit
     NELM, it looks inside the SCF cycle and lets FHI-aims stop by itself, like WalltimeHandler with
@@ -214,15 +216,16 @@ class ScfMonitorHandler(ErrorHandler):
         try:
             steps, checkpoint = self._checkpoint(directory)
             # Not converging at the checkpoint, the density matrices the next run restarts from,
-            # and still not converging with all the iterations done since
-            return checkpoint > 0 and all(scf_profile(s) is not ScfProfile.SLOW for s in (steps[:checkpoint], steps))
+            # and still not converging over the last checkpoint_interval iterations
+            recent = steps[-self.checkpoint_interval :]
+            return checkpoint > 0 and all(scf_profile(s) is not ScfProfile.SLOW for s in (steps[:checkpoint], recent))
         except Exception:
             return False
 
     def correct(self, directory="./"):
         """Perform corrections."""
         steps, checkpoint = self._checkpoint(directory)
-        profile = scf_profile(steps)
+        profile = scf_profile(steps[-self.checkpoint_interval :])
         # FHI-aims only checks that abort_scf exists: its content tells UnconvergedErrorHandler why
         actions = [{"file": "abort_scf", "action": {"_file_create": {"content": profile.value}}}]
         if self.rel_accuracy_residue is not None:
