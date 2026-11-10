@@ -168,8 +168,8 @@ class TestScfMonitorHandler:
             (100, None, False, False),  # before the first checkpoint, iteration 101
             (101, None, False, True),  # stalled at the checkpoint
             (101, lambda scf_steps: ScfProfile.SLOW, False, False),  # still converging
-            # stalled at the checkpoint, but converging with the iteration done since
-            (102, lambda scf_steps: ScfProfile.STALLED if len(scf_steps) <= 101 else ScfProfile.SLOW, False, False),
+            # stalled up to the checkpoint (101 iterations), converging over the last 100
+            (102, lambda scf_steps: ScfProfile.STALLED if len(scf_steps) == 101 else ScfProfile.SLOW, False, False),
             (101, None, True, False),  # abort_scf already written
             (None, None, False, False),  # FHI-aims has stopped: UnconvergedErrorHandler takes over
         ],
