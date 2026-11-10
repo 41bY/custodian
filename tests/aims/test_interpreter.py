@@ -39,3 +39,15 @@ class TestAimsModder:
         )
         assert (static_dir / "geometry.in").read_text() == "next step"
         assert (static_dir / "control.in").read_text() == control
+
+    def test_file_action_wildcards(self, static_dir: "Path") -> None:
+        for spin in (1, 2):
+            (static_dir / f"D_spin_0{spin}_kpt_000001.csc").touch()
+        AimsModder(directory=str(static_dir)).apply_actions(
+            [
+                {"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}},
+                {"file": "abort_scf", "action": {"_file_create": {"content": ""}}},
+            ]
+        )
+        assert not list(static_dir.glob("D_spin_*"))
+        assert (static_dir / "abort_scf").is_file()

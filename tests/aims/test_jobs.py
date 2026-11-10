@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 from pyfhiaims.control.control import AimsControl
 
+from custodian.aims.interpreter import AimsModder
 from custodian.aims.jobs import AIMS_OUTPUT_FILES, AimsJob
 from custodian.custodian import Custodian
 from tests.conftest import TEST_FILES
@@ -112,6 +113,24 @@ class TestAimsJob:
         assert process.wait(timeout=60) == 0
         assert (static_dir / job.output_file).read_text() == "Have a nice day.\n"
         assert (static_dir / job.stderr_file).read_text() == "on stderr\n"
+
+    def test_run_removes_abort_scf(self, static_dir: "Path") -> None:
+        # left by ScfMonitorHandler for the previous run
+        (static_dir / "abort_scf").touch()
+        assert AimsJob(FAKE_AIMS).run(directory=str(static_dir)).wait(timeout=60) == 0
+        assert not (static_dir / "abort_scf").exists()
+
+    @pytest.mark.parametrize(("elsi_restart", "kept"), [(None, False), ("read", False), ("write scf_converged", True)])
+    def test_postprocess_density_matrices(self, static_dir: "Path", elsi_restart: str | None, kept: bool) -> None:
+        if elsi_restart is not None:
+            action = {"_set": {"parameters->elsi_restart": elsi_restart}}
+            AimsModder(directory=str(static_dir)).apply_actions([{"dict": "control.in", "action": action}])
+        job = AimsJob(FAKE_AIMS)
+        job.setup(directory=str(static_dir))
+        # written for the restarts of ScfMonitorHandler, kept only if the original input asked for them
+        (static_dir / "D_spin_01_kpt_000001.csc").touch()
+        job.postprocess(directory=str(static_dir))
+        assert (static_dir / "D_spin_01_kpt_000001.csc").exists() is kept
 
     def test_custodian_run(self, static_dir: "Path") -> None:
         job = AimsJob(FAKE_AIMS)

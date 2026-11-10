@@ -4,16 +4,26 @@ try to detect common errors in FHI-aims runs and attempt to fix them on the fly
 by modifying the input files.
 """
 
+import logging
 import os
+import re
+from glob import glob
 
 from pyfhiaims.control.control import AimsControl
 from pyfhiaims.geometry.geometry import AimsGeometry
 
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.io import load_aims_stdout
-from custodian.aims.utils import ScfProfile, is_valid_geometry, scf_profile
+from custodian.aims.utils import ScfProfile, density_change, is_valid_geometry, scf_profile
 from custodian.custodian import ErrorHandler
 from custodian.utils import backup
+
+logger = logging.getLogger(__name__)
+
+# The sc_accuracy_rho of the run, as FHI-aims reports it: set in control.in, or chosen by FHI-aims
+SC_ACCURACY_RHO = re.compile(
+    r"(?:Convergence accuracy of self-consistent charge density:|FHI-aims chose sc_accuracy_rho =)\s+(\S+)"
+)
 
 AIMS_BACKUP_FILES = {
     "control.in",
@@ -121,6 +131,102 @@ class UnconvergedErrorHandler(ErrorHandler):
 
         # Unfixable error. Just return None for actions.
         return {"errors": errors, "actions": None}
+
+
+class ScfMonitorHandler(ErrorHandler):
+    """
+    Monitor the SCF cycle while FHI-aims runs, and stop it when it is not converging.
+
+    Every checkpoint_interval iterations (at iteration checkpoint_interval + 1, 2 * checkpoint_interval
+    + 1, ..., where "elsi_restart read_and_write checkpoint_interval" writes the density matrices),
+    the SCF cycle up to that iteration is classified with custodian.aims.utils.scf_profile. If it is
+    not SLOW, the handler writes abort_scf, on which FHI-aims stops at the end of the iteration in
+    progress, and UnconvergedErrorHandler corrects the stopped run. The next run restarts from the
+    density matrices of the checkpoint, unless its density change is above rel_accuracy_residue
+    times sc_accuracy_rho: then they are deleted, and the next run starts from scratch.
+
+    Unlike NonConvergingErrorHandler for VASP, which terminates a run whose last ionic steps all hit
+    NELM, it looks inside the SCF cycle and lets FHI-aims stop by itself, like WalltimeHandler with
+    STOPCAR, so that the density matrices on disk are complete.
+
+    The control.in settings it relies on are in settings_override, for AimsJob (atomate2 passes
+    them). Without them, the next run starts from scratch.
+    """
+
+    is_monitor = True
+    # FHI-aims stops by itself on abort_scf, at the end of an iteration
+    is_terminating = False
+
+    def __init__(
+        self,
+        output_filename: str = "aims.out",
+        checkpoint_interval: int = 100,
+        rel_accuracy_residue: float | None = 100,
+        sc_iter_limit: int = 1000,
+    ) -> None:
+        """Initialize the handler with the output file to check.
+
+        Args:
+            output_filename (str): Filename for the FHI-aims output. Change
+                this only if it is different from the default (unlikely).
+            checkpoint_interval (int): Number of SCF iterations between two checks, and between two
+                writes of the density matrices. Defaults to 100.
+            rel_accuracy_residue (float | None): Largest density change at the checkpoint, in units
+                of sc_accuracy_rho, from which the next run restarts. None switches off the writing
+                of the density matrices and the restarts. Defaults to 100, two decades from
+                convergence: further from it, restarting from the same orbitals may fail.
+            sc_iter_limit (int): sc_iter_limit set in control.in. Defaults to 1000.
+        """
+        self.output_filename = output_filename
+        self.checkpoint_interval = checkpoint_interval
+        self.rel_accuracy_residue = rel_accuracy_residue
+        self.sc_iter_limit = sc_iter_limit
+
+    @property
+    def settings_override(self) -> list[dict]:
+        """The control.in settings the handler relies on, for AimsJob(settings_override=...)."""
+        settings: dict[str, int | str] = {"parameters->sc_iter_limit": self.sc_iter_limit}
+        if self.rel_accuracy_residue is not None:
+            settings["parameters->elsi_restart"] = f"read_and_write {self.checkpoint_interval}"
+        return [{"dict": "control.in", "action": {"_set": settings}}]
+
+    def _checkpoint(self, directory: str) -> tuple[list[dict], int]:
+        """The SCF iterations of the cycle in progress, and the last checkpoint they passed (0 if none)."""
+        out = load_aims_stdout(os.path.join(directory, self.output_filename))
+        if out.errors or out.is_finished_ok:  # FHI-aims has stopped: UnconvergedErrorHandler takes over
+            return [], 0
+        steps = [step for step in out.results["ionic_steps"][-1]["scf_steps"] if "charge_density_change" in step]
+        n_checks = (len(steps) - 1) // self.checkpoint_interval
+        return steps, n_checks * self.checkpoint_interval + 1 if n_checks > 0 else 0
+
+    def check(self, directory="./") -> bool:
+        """Check for error."""
+        if os.path.isfile(os.path.join(directory, "abort_scf")):  # already stopping
+            return False
+        try:
+            steps, checkpoint = self._checkpoint(directory)
+            return checkpoint > 0 and scf_profile(steps[:checkpoint]) is not ScfProfile.SLOW
+        except Exception:
+            return False
+
+    def correct(self, directory="./"):
+        """Perform corrections."""
+        steps, checkpoint = self._checkpoint(directory)
+        actions = [{"file": "abort_scf", "action": {"_file_create": {"content": ""}}}]
+        if self.rel_accuracy_residue is not None:
+            if not glob("D_spin_*.csc", root_dir=directory):
+                logger.warning("No density matrices to restart from: pass settings_override to AimsJob")
+            else:
+                with open(os.path.join(directory, self.output_filename)) as file:
+                    target = next((float(m[1]) for line in file if (m := SC_ACCURACY_RHO.search(line))), None)
+                # The density change of the checkpoint, smoothed as in scf_profile
+                residue = 10 ** density_change(steps[:checkpoint])[-9:].mean()
+                if target is not None and residue > self.rel_accuracy_residue * target:
+                    # Orbitals are far from convergence, delete them to start from scratch
+                    actions.append({"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}})
+
+        AimsModder(directory=directory).apply_actions(actions)
+        return {"errors": ["Non-converging SCF", scf_profile(steps[:checkpoint]).value], "actions": actions}
 
 
 class RoundChargeErrorHandler(ErrorHandler):

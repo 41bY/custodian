@@ -1,6 +1,7 @@
 """Implements various interpreters and modders for FHI-aims."""
 
 import os
+from glob import glob
 
 from pyfhiaims.control.control import AimsControl
 from pyfhiaims.geometry.geometry import AimsGeometry
@@ -43,6 +44,8 @@ class AimsModder(Modder):
                 'action': moddermodification} or {'dict': 'control.in',
                 'action': moddermodification}, the latter acting on the keys of
                 AimsControl.as_dict(), e.g. {"_set": {"parameters->sc_iter_limit": 300}}.
+                A filename with wildcards acts on every matching file, e.g. "D_spin_*.csc"
+                on the density matrices, which FHI-aims writes one per spin and k-point.
         """
         species_defaults = self.control.species_defaults  # not kept by as_dict/from_dict
         modified = []
@@ -53,7 +56,11 @@ class AimsModder(Modder):
                 modified.append(action["dict"])
                 self.control = self.modify_object(action["action"], self.control)
             elif "file" in action:
-                self.modify(action["action"], action["file"])
+                pattern = action["file"]
+                files = sorted(glob(pattern, root_dir=self.directory)) if set("*?[") & set(pattern) else [pattern]
+                for file in files:
+                    # Full path: FileActions.file_create opens the file name as given, ignoring the directory
+                    self.modify(action["action"], os.path.abspath(os.path.join(self.directory, file)))
             else:
                 raise ValueError(f"Unrecognized format: {action}")
         if not modified:
