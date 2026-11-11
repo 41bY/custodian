@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import pytest
 from pyfhiaims.control.control import AimsControl
 
-from custodian.aims.handlers import RoundChargeErrorHandler, ScfMonitorHandler, UnconvergedErrorHandler
+from custodian.aims.handlers import SCF_MONITOR_OFF, RoundChargeErrorHandler, ScfMonitorHandler, UnconvergedErrorHandler
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.utils import ScfProfile
 from custodian.utils import tracked_lru_cache
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 KERKER = {"preconditioner": "kerker 2.0", "charge_mix_param": 0.1, "spin_mix_param": 0.1, "prec_mix_param": 0.1}
 LOWGAP = {"adjust_scf_param": "lowgap charge_mix_param 0.04"}
 DAMPED = {"charge_mix_param": 0.05, "spin_mix_param": 0.05, "prec_mix_param": 0.05}
+DELETE_ABORT = {"file": "abort_scf", "action": {"_file_delete": {"mode": "actual"}}}
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +40,11 @@ def copy_files(name: str, tmp_path: "Path") -> str:
 
 def set_parameters(parameters: dict) -> dict:
     return {f"parameters->{key}": val for key, val in parameters.items()}
+
+
+def set_control(directory: str, parameters: dict) -> None:
+    action = {"_set": set_parameters(parameters)}
+    AimsModder(directory=directory).apply_actions([{"dict": "control.in", "action": action}])
 
 
 def aborted_run(tmp_path: "Path", n_iterations: int | None = None) -> str:
@@ -134,9 +140,54 @@ class TestUnconvergedErrorHandler:
             monkeypatch.setattr("custodian.aims.handlers.scf_profile", lambda scf_steps: ScfProfile.SLOW)
         handler = UnconvergedErrorHandler()
         assert handler.check(directory=directory)
-        assert handler.correct(directory=directory) == {
-            "errors": ["Unconverged", profile.value],
-            "actions": [{"dict": "control.in", "action": {"_set": set_parameters(DAMPED)}}],
+        actions = [{"dict": "control.in", "action": {"_set": set_parameters(DAMPED)}}]
+        if stopped_for:
+            actions.append(DELETE_ABORT)
+        assert handler.correct(directory=directory) == {"errors": ["Unconverged", profile.value], "actions": actions}
+
+    @pytest.mark.parametrize(
+        ("restarted", "density_matrices", "settings", "actions"),
+        [
+            # first stop: the same settings, from the density matrices of the checkpoint
+            (False, True, {}, [DELETE_ABORT]),
+            # this run already restarted from them, or they were deleted: up the ladder
+            (True, True, {}, [{"dict": "control.in", "action": {"_set": set_parameters(DAMPED)}}, DELETE_ABORT]),
+            (False, False, {}, [{"dict": "control.in", "action": {"_set": set_parameters(DAMPED)}}, DELETE_ABORT]),
+            # nothing left to change: a last run, which ScfMonitorHandler does not stop
+            (
+                True,
+                True,
+                {**DAMPED, "sc_iter_limit": 1000},
+                [{"file": SCF_MONITOR_OFF, "action": {"_file_create": {"content": ""}}}, DELETE_ABORT],
+            ),
+        ],
+    )
+    def test_correct_stopped(
+        self, tmp_path: "Path", restarted: bool, density_matrices: bool, settings: dict, actions: list
+    ) -> None:
+        directory = aborted_run(tmp_path)
+        (tmp_path / "abort_scf").write_text(ScfProfile.STALLED.value)
+        if restarted:
+            output = (tmp_path / "aims.out").read_text()
+            (tmp_path / "aims.out").write_text(f"  Restarting calculation from saved density matrices.\n{output}")
+        if density_matrices:
+            (tmp_path / "D_spin_01_kpt_000001.csc").touch()
+        if settings:
+            set_control(directory, settings)
+
+        handler = UnconvergedErrorHandler()
+        assert handler.check(directory=directory)
+        assert handler.correct(directory=directory) == {"errors": ["Unconverged", "stalled"], "actions": actions}
+        assert not (tmp_path / "abort_scf").exists()
+
+    def test_correct_last_run(self, tmp_path: "Path") -> None:
+        # The last run went on to sc_iter_limit, unstopped, and did not converge either
+        directory = aborted_run(tmp_path)
+        (tmp_path / SCF_MONITOR_OFF).touch()
+        set_control(directory, {**DAMPED, "sc_iter_limit": 1000})
+        assert UnconvergedErrorHandler().correct(directory=directory) == {
+            "errors": ["Unconverged", "stalled"],
+            "actions": None,
         }
 
     def test_check_correct_ionic(self, tmp_path: "Path") -> None:
@@ -163,15 +214,16 @@ class TestScfMonitorHandler:
         ]
 
     @pytest.mark.parametrize(
-        ("n_iterations", "classify", "stopping", "expected"),
+        ("n_iterations", "classify", "control_file", "expected"),
         [
-            (100, None, False, False),  # before the first checkpoint, iteration 101
-            (101, None, False, True),  # stalled at the checkpoint
-            (101, lambda scf_steps: ScfProfile.SLOW, False, False),  # still converging
+            (100, None, None, False),  # before the first checkpoint, iteration 101
+            (101, None, None, True),  # stalled at the checkpoint
+            (101, lambda scf_steps: ScfProfile.SLOW, None, False),  # still converging
             # stalled up to the checkpoint (101 iterations), converging over the last 100
-            (102, lambda scf_steps: ScfProfile.STALLED if len(scf_steps) == 101 else ScfProfile.SLOW, False, False),
-            (101, None, True, False),  # abort_scf already written
-            (None, None, False, False),  # FHI-aims has stopped: UnconvergedErrorHandler takes over
+            (102, lambda scf_steps: ScfProfile.STALLED if len(scf_steps) == 101 else ScfProfile.SLOW, None, False),
+            (101, None, "abort_scf", False),  # already stopping
+            (101, None, SCF_MONITOR_OFF, False),  # the last run of the job, not stopped
+            (None, None, None, False),  # FHI-aims has stopped: UnconvergedErrorHandler takes over
         ],
     )
     def test_check(
@@ -180,14 +232,14 @@ class TestScfMonitorHandler:
         monkeypatch: pytest.MonkeyPatch,
         n_iterations: int | None,
         classify: "Callable[[list[dict]], ScfProfile] | None",
-        stopping: bool,
+        control_file: str | None,
         expected: bool,
     ) -> None:
         directory = aborted_run(tmp_path, n_iterations)
         if classify is not None:
             monkeypatch.setattr("custodian.aims.handlers.scf_profile", classify)
-        if stopping:
-            (tmp_path / "abort_scf").touch()
+        if control_file:
+            (tmp_path / control_file).touch()
         assert ScfMonitorHandler().check(directory=directory) is expected
 
     @pytest.mark.parametrize(

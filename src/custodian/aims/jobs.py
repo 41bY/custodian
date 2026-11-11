@@ -15,7 +15,7 @@ from monty.serialization import dumpfn, loadfn
 from monty.shutil import decompress_dir
 from pyfhiaims.control.control import AimsControl
 
-from custodian.aims.handlers import AIMS_BACKUP_FILES
+from custodian.aims.handlers import AIMS_BACKUP_FILES, SCF_MONITOR_OFF
 from custodian.aims.interpreter import AimsModder
 from custodian.custodian import Job
 from custodian.utils import backup
@@ -97,6 +97,10 @@ class AimsJob(Job):
         inputs, continues a stopped run (auto_continue) and applies settings_override.
         """
         decompress_dir(directory)
+
+        # Left by the last run of a previous job in this directory: this job starts monitored again
+        if os.path.isfile(os.path.join(directory, SCF_MONITOR_OFF)):
+            os.remove(os.path.join(directory, SCF_MONITOR_OFF))
 
         if self.backup:
             for file in AIMS_INPUT_FILES:

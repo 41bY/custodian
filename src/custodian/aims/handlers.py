@@ -35,6 +35,9 @@ AIMS_BACKUP_FILES = {
     "std_err.txt",
 }
 
+# Written by UnconvergedErrorHandler for the last run of a job, which ScfMonitorHandler does not stop
+SCF_MONITOR_OFF = "scf_monitor_off"
+
 
 class UnconvergedErrorHandler(ErrorHandler):
     """
@@ -45,6 +48,9 @@ class UnconvergedErrorHandler(ErrorHandler):
     - SLOW, still converging: more iterations, then a faster mixing, then a longer Pulay history;
     - STALLED or OSCILLATING: the Kerker preconditioner, then a damped mixing, then more
       iterations.
+    A cycle stopped by ScfMonitorHandler first restarts from the density matrices of the checkpoint
+    with the same settings (a fresh Pulay history), then goes up the same ladder; when nothing is
+    left to change, a last run goes on to sc_iter_limit without being stopped.
     """
 
     is_monitor = False
@@ -87,16 +93,25 @@ class UnconvergedErrorHandler(ErrorHandler):
             # (written in abort_scf), not reclassified with the few iterations FHI-aims did after
             abort = Path(directory, "abort_scf")
             stopped = abort.read_text().strip() if abort.is_file() else ""
-            if stopped in {p.value for p in ScfProfile}:
-                profile = ScfProfile(stopped)
-            else:
-                profile = scf_profile(out.get_image(-1).scf)
+            monitored = stopped in {p.value for p in ScfProfile}
+            profile = ScfProfile(stopped) if monitored else scf_profile(out.get_image(-1).scf)
             errors.append(profile.value)
             limit = int(params.get("sc_iter_limit", 0))
             # Without sc_iter_limit, FHI-aims may stop the SCF cycle early, at iteration 100
             new_settings = {} if limit else {"sc_iter_limit": self.sc_iter_limit}
+            # First stop by ScfMonitorHandler: the same settings, restarting from the density matrices
+            # of the checkpoint with a fresh Pulay history, so that stopping a cycle that would have
+            # converged costs little. Not if this run already restarted from them, or they were deleted.
+            output = Path(directory, self.output_filename).read_text(errors="replace") if monitored else ""
+            same_settings = (
+                monitored
+                and bool(glob("D_spin_*.csc", root_dir=directory))
+                and "Restarting calculation from saved density matrices" not in output
+            )
             # Setting charge_mix_param or spin_mix_param switches off adjust_scf: set both.
-            if profile is ScfProfile.SLOW and limit:
+            if same_settings:
+                logger.info("Restarting from the density matrices with the same settings")
+            elif profile is ScfProfile.SLOW and limit:
                 if limit < self.max_sc_iter_limit:
                     new_settings = {"sc_iter_limit": self.max_sc_iter_limit}
                 elif "charge_mix_param" not in params and "adjust_scf_param" not in params:
@@ -123,6 +138,12 @@ class UnconvergedErrorHandler(ErrorHandler):
             if new_settings:
                 new_settings = {f"parameters->{key}": val for key, val in new_settings.items()}
                 actions.append({"dict": "control.in", "action": {"_set": new_settings}})
+            elif monitored and not same_settings and not Path(directory, SCF_MONITOR_OFF).is_file():
+                # Nothing left to change after a stop: a last run, which ScfMonitorHandler does not stop
+                actions.append({"file": SCF_MONITOR_OFF, "action": {"_file_create": {"content": ""}}})
+            if actions or same_settings:
+                if monitored:
+                    actions.append({"file": "abort_scf", "action": {"_file_delete": {"mode": "actual"}}})
                 # Unlike VASP, FHI-aims stops a relaxation at its first unconverged SCF
                 # cycle, so continue from its last geometry.
                 if out.metadata.relax and is_valid_geometry("geometry.in.next_step", directory):
@@ -160,7 +181,8 @@ class ScfMonitorHandler(ErrorHandler):
     STOPCAR, so that the density matrices on disk are complete.
 
     The control.in settings it relies on are in settings_override, for AimsJob (atomate2 passes
-    them). Without them, the next run starts from scratch.
+    them). Without them, the next run starts from scratch. It does not stop the last run of a job
+    (SCF_MONITOR_OFF, written by UnconvergedErrorHandler when nothing is left to change).
     """
 
     is_monitor = True
@@ -211,7 +233,8 @@ class ScfMonitorHandler(ErrorHandler):
 
     def check(self, directory="./") -> bool:
         """Check for error."""
-        if os.path.isfile(os.path.join(directory, "abort_scf")):  # already stopping
+        # Already stopping, or the last run of the job, which goes on to sc_iter_limit
+        if any(os.path.isfile(os.path.join(directory, name)) for name in ("abort_scf", SCF_MONITOR_OFF)):
             return False
         try:
             steps, checkpoint = self._checkpoint(directory)
