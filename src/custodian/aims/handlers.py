@@ -6,7 +6,6 @@ by modifying the input files.
 
 import logging
 import os
-import re
 from glob import glob
 from pathlib import Path
 
@@ -15,16 +14,11 @@ from pyfhiaims.geometry.geometry import AimsGeometry
 
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.io import load_aims_stdout
-from custodian.aims.utils import ScfProfile, density_change, is_valid_geometry, scf_profile
+from custodian.aims.utils import ScfProfile, is_valid_geometry, scf_gap, scf_profile
 from custodian.custodian import ErrorHandler
 from custodian.utils import backup
 
 logger = logging.getLogger(__name__)
-
-# The sc_accuracy_rho of the run, as FHI-aims reports it: set in control.in, or chosen by FHI-aims
-SC_ACCURACY_RHO = re.compile(
-    r"(?:Convergence accuracy of self-consistent charge density:|FHI-aims chose sc_accuracy_rho =)\s+(\S+)"
-)
 
 AIMS_BACKUP_FILES = {
     "control.in",
@@ -34,9 +28,6 @@ AIMS_BACKUP_FILES = {
     "aims.out",
     "std_err.txt",
 }
-
-# Written by UnconvergedErrorHandler for the last run of a job, which ScfMonitorHandler does not stop
-SCF_MONITOR_OFF = "scf_monitor_off"
 
 
 class UnconvergedErrorHandler(ErrorHandler):
@@ -48,9 +39,15 @@ class UnconvergedErrorHandler(ErrorHandler):
     - SLOW, still converging: more iterations, then a faster mixing, then a longer Pulay history;
     - STALLED or OSCILLATING: the Kerker preconditioner, then a damped mixing, then more
       iterations.
-    A cycle stopped by ScfMonitorHandler first restarts from the density matrices of the checkpoint
-    with the same settings (a fresh Pulay history), then goes up the same ladder; when nothing is
-    left to change, a last run goes on to sc_iter_limit without being stopped.
+    If the run left density matrices (elsi_restart, see ScfMonitorHandler), the next run restarts
+    from them depending on the gap of the cycle (see custodian.aims.utils.scf_gap) and on its
+    profile:
+    - with a gap: first the same settings (a fresh Pulay history), then the ladder, always from the
+      density matrices;
+    - STALLED without a gap: the same settings from the density matrices, then the ladder from
+      scratch;
+    - OSCILLATING without a gap: the ladder from scratch.
+    The same settings are tried once per density matrices, and never from scratch.
     """
 
     is_monitor = False
@@ -94,18 +91,22 @@ class UnconvergedErrorHandler(ErrorHandler):
             abort = Path(directory, "abort_scf")
             stopped = abort.read_text().strip() if abort.is_file() else ""
             monitored = stopped in {p.value for p in ScfProfile}
-            profile = ScfProfile(stopped) if monitored else scf_profile(out.get_image(-1).scf)
-            errors.append(profile.value)
+            scf_steps = out.get_image(-1).scf
+            profile = ScfProfile(stopped) if monitored else scf_profile(scf_steps)
+            # With a gap, the half-converged orbitals are worth restarting from, also with new settings
+            gapped = scf_gap(scf_steps) > 0.1
+            errors += [profile.value, "gap" if gapped else "no gap"]
             limit = int(params.get("sc_iter_limit", 0))
             # Without sc_iter_limit, FHI-aims may stop the SCF cycle early, at iteration 100
             new_settings = {} if limit else {"sc_iter_limit": self.sc_iter_limit}
-            # First stop by ScfMonitorHandler: the same settings, restarting from the density matrices
-            # of the checkpoint with a fresh Pulay history, so that stopping a cycle that would have
-            # converged costs little. Not if this run already restarted from them, or they were deleted.
-            output = Path(directory, self.output_filename).read_text(errors="replace") if monitored else ""
+            # The same settings, restarting from the density matrices with a fresh Pulay history: once,
+            # with a gap or on a plateau, and only if the run left them (ScfMonitorHandler on)
+            density_matrices = bool(glob("D_spin_*.csc", root_dir=directory))
+            output = Path(directory, self.output_filename).read_text(errors="replace") if density_matrices else ""
             same_settings = (
-                monitored
-                and bool(glob("D_spin_*.csc", root_dir=directory))
+                profile is not ScfProfile.SLOW
+                and (gapped or profile is ScfProfile.STALLED)
+                and density_matrices
                 and "Restarting calculation from saved density matrices" not in output
             )
             # Setting charge_mix_param or spin_mix_param switches off adjust_scf: set both.
@@ -136,11 +137,14 @@ class UnconvergedErrorHandler(ErrorHandler):
                     new_settings["sc_iter_limit"] = self.max_sc_iter_limit
 
             if new_settings:
+                # New mixing settings restart from the density matrices only with a gap; otherwise from
+                # scratch, as the last rungs of VASP's NonConvergingErrorHandler (ICHARG 2)
+                keep = gapped and profile is not ScfProfile.SLOW
+                stale = set(new_settings) - {"sc_iter_limit"} and density_matrices and not keep
                 new_settings = {f"parameters->{key}": val for key, val in new_settings.items()}
                 actions.append({"dict": "control.in", "action": {"_set": new_settings}})
-            elif monitored and not same_settings and not Path(directory, SCF_MONITOR_OFF).is_file():
-                # Nothing left to change after a stop: a last run, which ScfMonitorHandler does not stop
-                actions.append({"file": SCF_MONITOR_OFF, "action": {"_file_create": {"content": ""}}})
+                if stale:
+                    actions.append({"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}})
             if actions or same_settings:
                 if monitored:
                     actions.append({"file": "abort_scf", "action": {"_file_delete": {"mode": "actual"}}})
@@ -168,21 +172,19 @@ class ScfMonitorHandler(ErrorHandler):
 
     Checkpoints come every checkpoint_interval iterations (at iteration checkpoint_interval + 1,
     2 * checkpoint_interval + 1, ..., where "elsi_restart read_and_write checkpoint_interval" writes
-    the density matrices). Once a checkpoint is passed, the SCF cycle is classified with
-    custodian.aims.utils.scf_profile up to the checkpoint and over the last checkpoint_interval
-    iterations. If neither is SLOW, the handler writes abort_scf, on which FHI-aims stops at the end
-    of the iteration in progress, and UnconvergedErrorHandler corrects the stopped run. The next run
-    restarts from the density matrices of the checkpoint, unless its density change is above
-    rel_accuracy_residue times sc_accuracy_rho: then they are deleted, and the next run starts from
-    scratch.
+    the density matrices). Once the SCF cycle has passed the first checkpoint, every check
+    classifies its last checkpoint_interval iterations with custodian.aims.utils.scf_profile. If
+    they are not SLOW, the handler writes abort_scf, on which FHI-aims stops at the end of the
+    iteration in progress, and UnconvergedErrorHandler corrects the stopped run, deciding whether
+    the next run restarts from the density matrices of the last checkpoint. In a relaxation, every
+    ionic step is monitored.
 
     Unlike NonConvergingErrorHandler for VASP, which terminates a run whose last ionic steps all hit
     NELM, it looks inside the SCF cycle and lets FHI-aims stop by itself, like WalltimeHandler with
     STOPCAR, so that the density matrices on disk are complete.
 
     The control.in settings it relies on are in settings_override, for AimsJob (atomate2 passes
-    them). Without them, the next run starts from scratch. It does not stop the last run of a job
-    (SCF_MONITOR_OFF, written by UnconvergedErrorHandler when nothing is left to change).
+    them). Without them, the next run starts from scratch.
     """
 
     is_monitor = True
@@ -192,8 +194,8 @@ class ScfMonitorHandler(ErrorHandler):
     def __init__(
         self,
         output_filename: str = "aims.out",
-        checkpoint_interval: int = 100,
-        rel_accuracy_residue: float | None = 100,
+        checkpoint_interval: int = 150,
+        restart: bool = True,
         sc_iter_limit: int = 1000,
     ) -> None:
         """Initialize the handler with the output file to check.
@@ -201,24 +203,22 @@ class ScfMonitorHandler(ErrorHandler):
         Args:
             output_filename (str): Filename for the FHI-aims output. Change
                 this only if it is different from the default (unlikely).
-            checkpoint_interval (int): Number of SCF iterations between two checks, and between two
-                writes of the density matrices. Defaults to 100.
-            rel_accuracy_residue (float | None): Largest density change at the checkpoint, in units
-                of sc_accuracy_rho, from which the next run restarts. None switches off the writing
-                of the density matrices and the restarts. Defaults to 100, two decades from
-                convergence: further from it, restarting from the same orbitals may fail.
+            checkpoint_interval (int): Number of SCF iterations classified at each check, and
+                between two writes of the density matrices. Defaults to 150.
+            restart (bool): Whether FHI-aims writes the density matrices, from which the next run
+                may restart (see UnconvergedErrorHandler). Defaults to True.
             sc_iter_limit (int): sc_iter_limit set in control.in. Defaults to 1000.
         """
         self.output_filename = output_filename
         self.checkpoint_interval = checkpoint_interval
-        self.rel_accuracy_residue = rel_accuracy_residue
+        self.restart = restart
         self.sc_iter_limit = sc_iter_limit
 
     @property
     def settings_override(self) -> list[dict]:
         """The control.in settings the handler relies on, for AimsJob(settings_override=...)."""
         settings: dict[str, int | str] = {"parameters->sc_iter_limit": self.sc_iter_limit}
-        if self.rel_accuracy_residue is not None:
+        if self.restart:
             settings["parameters->elsi_restart"] = f"read_and_write {self.checkpoint_interval}"
         return [{"dict": "control.in", "action": {"_set": settings}}]
 
@@ -233,36 +233,23 @@ class ScfMonitorHandler(ErrorHandler):
 
     def check(self, directory="./") -> bool:
         """Check for error."""
-        # Already stopping, or the last run of the job, which goes on to sc_iter_limit
-        if any(os.path.isfile(os.path.join(directory, name)) for name in ("abort_scf", SCF_MONITOR_OFF)):
+        if os.path.isfile(os.path.join(directory, "abort_scf")):  # already stopping
             return False
         try:
             steps, checkpoint = self._checkpoint(directory)
-            # Not converging at the checkpoint, the density matrices the next run restarts from,
-            # and still not converging over the last checkpoint_interval iterations
-            recent = steps[-self.checkpoint_interval :]
-            return checkpoint > 0 and all(scf_profile(s) is not ScfProfile.SLOW for s in (steps[:checkpoint], recent))
+            # Past the first checkpoint, and not converging over the last checkpoint_interval iterations
+            return checkpoint > 0 and scf_profile(steps[-self.checkpoint_interval :]) is not ScfProfile.SLOW
         except Exception:
             return False
 
     def correct(self, directory="./"):
         """Perform corrections."""
-        steps, checkpoint = self._checkpoint(directory)
+        steps, _ = self._checkpoint(directory)
         profile = scf_profile(steps[-self.checkpoint_interval :])
         # FHI-aims only checks that abort_scf exists: its content tells UnconvergedErrorHandler why
         actions = [{"file": "abort_scf", "action": {"_file_create": {"content": profile.value}}}]
-        if self.rel_accuracy_residue is not None:
-            if not glob("D_spin_*.csc", root_dir=directory):
-                logger.warning("No density matrices to restart from: pass settings_override to AimsJob")
-            else:
-                with open(os.path.join(directory, self.output_filename)) as file:
-                    target = next((float(m[1]) for line in file if (m := SC_ACCURACY_RHO.search(line))), None)
-                # The density change of the checkpoint, smoothed as in scf_profile
-                residue = 10 ** density_change(steps[:checkpoint])[-9:].mean()
-                if target is not None and residue > self.rel_accuracy_residue * target:
-                    # Orbitals are far from convergence, delete them to start from scratch
-                    actions.append({"file": "D_spin_*.csc", "action": {"_file_delete": {"mode": "actual"}}})
-
+        if self.restart and not glob("D_spin_*.csc", root_dir=directory):
+            logger.warning("No density matrices to restart from: pass settings_override to AimsJob")
         AimsModder(directory=directory).apply_actions(actions)
         return {"errors": ["Non-converging SCF", profile.value], "actions": actions}
 

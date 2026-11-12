@@ -11,7 +11,6 @@ from unittest.mock import Mock, patch
 import pytest
 from pyfhiaims.control.control import AimsControl
 
-from custodian.aims.handlers import SCF_MONITOR_OFF
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.jobs import AIMS_OUTPUT_FILES, AimsJob
 from custodian.custodian import Custodian
@@ -114,12 +113,6 @@ class TestAimsJob:
         assert process.wait(timeout=60) == 0
         assert (static_dir / job.output_file).read_text() == "Have a nice day.\n"
         assert (static_dir / job.stderr_file).read_text() == "on stderr\n"
-
-    def test_setup_monitors_again(self, static_dir: "Path") -> None:
-        # left by the last run of a previous job in this directory
-        (static_dir / SCF_MONITOR_OFF).touch()
-        AimsJob(FAKE_AIMS).setup(directory=str(static_dir))
-        assert not (static_dir / SCF_MONITOR_OFF).exists()
 
     def test_run_removes_abort_scf(self, static_dir: "Path") -> None:
         # left by ScfMonitorHandler for the previous run
