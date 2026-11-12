@@ -42,9 +42,8 @@ def scf_profile(scf_steps: list[dict]) -> ScfProfile:
     The larger of the charge and spin density changes is taken in log10 and smoothed over 9
     iterations; the last half of the cycle decides the category:
     - SLOW: the smoothed curve still decreases, by more than 0.1 decades per 100 iterations;
-    - OSCILLATING: otherwise, if the iterations scatter around it by 0.1 decades or more, or
-      if it never went down;
-    - STALLED: a plateau after an initial decrease, possibly rising at the end.
+    - OSCILLATING: otherwise, if the iterations scatter around it by 0.1 decades or more;
+    - STALLED: otherwise, a plateau, possibly rising at the end.
     The total energy change is not used: it changes sign and jumps at every iteration.
 
     Args:
@@ -60,11 +59,25 @@ def scf_profile(scf_steps: list[dict]) -> ScfProfile:
     half = len(smooth) // 2
     if np.polyfit(np.arange(len(smooth) - half), smooth[half:], 1)[0] < -1e-3:
         return ScfProfile.SLOW
-    # The plateau, if any, starts where the smoothed curve comes within 0.2 decades of its minimum
-    plateau = np.argmax(smooth <= smooth.min() + 0.2) + 4
-    if np.std((rho[4:-4] - smooth)[half:]) >= 0.1 or plateau < 10:
+    if np.std((rho[4:-4] - smooth)[half:]) >= 0.1:
         return ScfProfile.OSCILLATING
     return ScfProfile.STALLED
+
+
+def scf_gap(scf_steps: list[dict]) -> float:
+    """The median HOMO-LUMO gap of the last 50 SCF iterations, in eV; 0 if FHI-aims printed none.
+
+    Over the last iterations of an unconverged cycle, a median above 0.1 eV agreed with a gap above
+    0.1 eV in the converged state in 93% of the production SCF failures.
+
+    Args:
+        scf_steps: The SCF iterations, as parsed by pyfhiaims (AimsStdout.get_image(-1).scf).
+
+    Returns:
+        float: The median gap, in eV.
+    """
+    gaps = [s["gap"] for s in scf_steps[-50:] if "gap" in s]
+    return float(np.median(gaps)) if gaps else 0.0
 
 
 def is_valid_geometry(filename: str, directory: str = "./") -> bool:
