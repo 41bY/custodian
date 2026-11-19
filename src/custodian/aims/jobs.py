@@ -15,6 +15,7 @@ from monty.serialization import dumpfn, loadfn
 from monty.shutil import decompress_dir
 from pyfhiaims.control.control import AimsControl
 
+from custodian.aims.failures import REPORT_FILE, write_report
 from custodian.aims.handlers import AIMS_BACKUP_FILES
 from custodian.aims.interpreter import AimsModder
 from custodian.custodian import Job
@@ -50,6 +51,7 @@ class AimsJob(Job):
         settings_override: list[dict] | None = None,
         auto_continue: bool | list[dict] = False,
         terminate_timeout: float = 10.0,
+        keep_failures_report: bool = False,
     ) -> None:
         """
         Args:
@@ -80,6 +82,9 @@ class AimsJob(Job):
                 do not exist, e.g. of a relaxation stopped before its first step, are skipped.
             terminate_timeout (float): Timeout in seconds to wait for graceful termination
                 (SIGTERM) before escalating to SIGKILL. Defaults to 10.0 seconds.
+            keep_failures_report (bool): Whether the report of the runs that the handlers write
+                (custodian.aims.failures.REPORT_FILE) is kept when the job succeeds, completed with
+                the converged run. If False, it is kept only when the job fails. Defaults to False.
         """
         self.aims_cmd = tuple(shlex.split(aims_cmd)) if isinstance(aims_cmd, str) else tuple(aims_cmd)
         self.output_file = output_file
@@ -90,6 +95,7 @@ class AimsJob(Job):
         self.settings_override = settings_override
         self.auto_continue = auto_continue
         self.terminate_timeout = terminate_timeout
+        self.keep_failures_report = keep_failures_report
 
     def setup(self, directory: str = "./") -> None:
         """
@@ -149,6 +155,14 @@ class AimsJob(Job):
 
     def postprocess(self, directory: str = "./") -> None:
         """Postprocessing includes renaming files where necessary."""
+        # The job succeeded: the report of its runs goes, unless it is kept, completed with this
+        # run (before the output gets its suffix)
+        if os.path.isfile(os.path.join(directory, REPORT_FILE)):
+            if self.keep_failures_report:
+                write_report(directory, output_filename=self.output_file)
+            else:
+                os.remove(os.path.join(directory, REPORT_FILE))
+
         for file in (*AIMS_OUTPUT_FILES, self.output_file):
             file = os.path.join(directory, file)
             if os.path.isfile(file):

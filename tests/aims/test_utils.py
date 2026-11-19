@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from custodian.aims.utils import ScfProfile, scf_gap, scf_profile
+from custodian.aims.utils import ScfProfile, scf_gap, scf_profile, scf_profile_metrics
 
 ITERATIONS = np.arange(200)
 DECREASING = -0.02 * ITERATIONS  # 2 decades every 100 iterations
@@ -26,6 +26,19 @@ def test_scf_profile(log_charge, log_spin, expected) -> None:
         for step, x in zip(scf_steps, log_spin, strict=True):
             step["spin_density_change"] = 10**x
     assert scf_profile(scf_steps) == expected
+
+
+@pytest.mark.parametrize(
+    ("log_charge", "expected"),
+    [
+        (DECREASING, (ScfProfile.SLOW, pytest.approx(-0.02), pytest.approx(0, abs=1e-12))),
+        (PLATEAU, (ScfProfile.STALLED, pytest.approx(0), pytest.approx(0, abs=1e-12))),
+        (DECREASING[:15], (ScfProfile.SLOW, None, None)),  # too few iterations to tell
+    ],
+)
+def test_scf_profile_metrics(log_charge, expected) -> None:
+    # the slope of the smoothed curve in decades per iteration, and the scatter around it
+    assert scf_profile_metrics([{"charge_density_change": 10**x} for x in log_charge]) == expected
 
 
 @pytest.mark.parametrize(

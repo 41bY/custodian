@@ -2,15 +2,18 @@
 
 import logging
 import os
-from enum import Enum
+from enum import StrEnum
 
 import numpy as np
 from pyfhiaims.geometry.geometry import AimsGeometry
 
 logger = logging.getLogger(__name__)
 
+# Above this median gap of the last iterations (scf_gap), in eV, an unconverged cycle has a gap.
+GAP_THRESHOLD = 0.1
 
-class ScfProfile(str, Enum):
+
+class ScfProfile(StrEnum):
     """How an unconverged SCF cycle behaved (see scf_profile)."""
 
     SLOW = "slow"
@@ -36,7 +39,7 @@ def density_change(scf_steps: list[dict]) -> np.ndarray:
     return np.log10(np.maximum(changes, 1e-15))
 
 
-def scf_profile(scf_steps: list[dict]) -> ScfProfile:
+def scf_profile_metrics(scf_steps: list[dict]) -> tuple[ScfProfile, float | None, float | None]:
     """Classify an unconverged SCF cycle from the change of the density at each iteration.
 
     The larger of the charge and spin density changes is taken in log10 and smoothed over 9
@@ -50,18 +53,34 @@ def scf_profile(scf_steps: list[dict]) -> ScfProfile:
         scf_steps: The SCF iterations, as parsed by pyfhiaims (AimsStdout.get_image(-1).scf).
 
     Returns:
-        ScfProfile: The category.
+        tuple: The category; the slope of the smoothed curve over the last half, in decades per
+            iteration; the scatter of the iterations around it, in decades. Fewer than 18
+            iterations are too few to tell: SLOW, without the two numbers.
     """
     rho = density_change(scf_steps)
     if len(rho) < 18:  # too few iterations to tell (fewer than 10 smoothed points), or none at all
-        return ScfProfile.SLOW
+        return ScfProfile.SLOW, None, None
     smooth = np.convolve(rho, np.ones(9) / 9, mode="valid")
     half = len(smooth) // 2
-    if np.polyfit(np.arange(len(smooth) - half), smooth[half:], 1)[0] < -1e-3:
-        return ScfProfile.SLOW
-    if np.std((rho[4:-4] - smooth)[half:]) >= 0.1:
-        return ScfProfile.OSCILLATING
-    return ScfProfile.STALLED
+    slope = float(np.polyfit(np.arange(len(smooth) - half), smooth[half:], 1)[0])
+    scatter = float(np.std((rho[4:-4] - smooth)[half:]))
+    if slope < -1e-3:
+        return ScfProfile.SLOW, slope, scatter
+    if scatter >= 0.1:
+        return ScfProfile.OSCILLATING, slope, scatter
+    return ScfProfile.STALLED, slope, scatter
+
+
+def scf_profile(scf_steps: list[dict]) -> ScfProfile:
+    """Classify an unconverged SCF cycle (see scf_profile_metrics).
+
+    Args:
+        scf_steps: The SCF iterations, as parsed by pyfhiaims (AimsStdout.get_image(-1).scf).
+
+    Returns:
+        ScfProfile: The category.
+    """
+    return scf_profile_metrics(scf_steps)[0]
 
 
 def scf_gap(scf_steps: list[dict]) -> float:

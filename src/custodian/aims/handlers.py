@@ -12,9 +12,10 @@ from pathlib import Path
 from pyfhiaims.control.control import AimsControl
 from pyfhiaims.geometry.geometry import AimsGeometry
 
+from custodian.aims.failures import record_check, write_report
 from custodian.aims.interpreter import AimsModder
 from custodian.aims.io import load_aims_stdout
-from custodian.aims.utils import ScfProfile, is_valid_geometry, scf_gap, scf_profile
+from custodian.aims.utils import GAP_THRESHOLD, ScfProfile, is_valid_geometry, scf_gap, scf_profile
 from custodian.custodian import ErrorHandler
 from custodian.utils import backup
 
@@ -48,12 +49,17 @@ class UnconvergedErrorHandler(ErrorHandler):
       scratch;
     - OSCILLATING without a gap: the ladder from scratch.
     The same settings are tried once per density matrices, and never from scratch.
+    Every correction writes the report of the runs (custodian.aims.failures), before its backup.
     """
 
     is_monitor = False
 
     def __init__(
-        self, output_filename: str = "aims.out", sc_iter_limit: int = 300, max_sc_iter_limit: int = 1000
+        self,
+        output_filename: str = "aims.out",
+        sc_iter_limit: int = 300,
+        max_sc_iter_limit: int = 1000,
+        report: bool = True,
     ) -> None:
         """Initialize the handler with the output file to check.
 
@@ -64,10 +70,13 @@ class UnconvergedErrorHandler(ErrorHandler):
                 sc_iter_limit also switches off the automatic early stop of the SCF
                 cycle, which FHI-aims applies only without one. Defaults to 300.
             max_sc_iter_limit (int): sc_iter_limit of the last attempt. Defaults to 1000.
+            report (bool): Whether every correction writes the report of the runs
+                (custodian.aims.failures.REPORT_FILE). Defaults to True.
         """
         self.output_filename = output_filename
         self.sc_iter_limit = sc_iter_limit
         self.max_sc_iter_limit = max_sc_iter_limit
+        self.report = report
 
     def check(self, directory="./") -> bool:
         """Check for error."""
@@ -94,7 +103,7 @@ class UnconvergedErrorHandler(ErrorHandler):
             scf_steps = out.get_image(-1).scf
             profile = ScfProfile(stopped) if monitored else scf_profile(scf_steps)
             # With a gap, the half-converged orbitals are worth restarting from, also with new settings
-            gapped = scf_gap(scf_steps) > 0.1
+            gapped = scf_gap(scf_steps) > GAP_THRESHOLD
             errors += [profile.value, "gap" if gapped else "no gap"]
             limit = int(params.get("sc_iter_limit", 0))
             # Without sc_iter_limit, FHI-aims may stop the SCF cycle early, at iteration 100
@@ -157,6 +166,10 @@ class UnconvergedErrorHandler(ErrorHandler):
             # Just continue optimizing from the last geometry
             actions.append({"file": "geometry.in.next_step", "action": {"_file_copy": {"dest": "geometry.in"}}})
 
+        if self.report:
+            # Before the backup, which then holds this run
+            pending = {"handler": type(self).__name__, "errors": errors, "actions": actions or None}
+            write_report(directory, pending, self.output_filename)
         if actions:
             backup(AIMS_BACKUP_FILES, directory=directory)
             AimsModder(directory=directory).apply_actions(actions)
@@ -185,6 +198,9 @@ class ScfMonitorHandler(ErrorHandler):
 
     The control.in settings it relies on are in settings_override, for AimsJob (atomate2 passes
     them). Without them, the next run starts from scratch.
+
+    Every check is recorded in the report of the runs (custodian.aims.failures): no other file keeps
+    the checks that do not stop the run.
     """
 
     is_monitor = True
@@ -197,6 +213,7 @@ class ScfMonitorHandler(ErrorHandler):
         checkpoint_interval: int = 150,
         restart: bool = True,
         sc_iter_limit: int = 1000,
+        report: bool = True,
     ) -> None:
         """Initialize the handler with the output file to check.
 
@@ -208,11 +225,14 @@ class ScfMonitorHandler(ErrorHandler):
             restart (bool): Whether FHI-aims writes the density matrices, from which the next run
                 may restart (see UnconvergedErrorHandler). Defaults to True.
             sc_iter_limit (int): sc_iter_limit set in control.in. Defaults to 1000.
+            report (bool): Whether every check is recorded in the report of the runs
+                (custodian.aims.failures.REPORT_FILE). Defaults to True.
         """
         self.output_filename = output_filename
         self.checkpoint_interval = checkpoint_interval
         self.restart = restart
         self.sc_iter_limit = sc_iter_limit
+        self.report = report
 
     @property
     def settings_override(self) -> list[dict]:
@@ -238,9 +258,12 @@ class ScfMonitorHandler(ErrorHandler):
         try:
             steps, checkpoint = self._checkpoint(directory)
             # Past the first checkpoint, and not converging over the last checkpoint_interval iterations
-            return checkpoint > 0 and scf_profile(steps[-self.checkpoint_interval :]) is not ScfProfile.SLOW
+            stop = checkpoint > 0 and scf_profile(steps[-self.checkpoint_interval :]) is not ScfProfile.SLOW
         except Exception:
             return False
+        if self.report and steps:
+            record_check(directory, steps, checkpoint, self.checkpoint_interval, stop)
+        return stop
 
     def correct(self, directory="./"):
         """Perform corrections."""
